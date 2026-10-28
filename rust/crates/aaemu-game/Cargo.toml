@@ -44,3 +44,5 @@ twilight-model.workspace = true
 [dev-dependencies]
 tokio = { workspace = true, features = ["test-util"] }
 
+[build-dependencies]
+winresource.workspace = true

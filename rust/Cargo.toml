@@ -46,6 +46,8 @@ twilight-http = { version = "0.16", default-features = false, features = ["rustl
 twilight-model = "0.16"
 # aaemu-testclient: inflating the level-4 (DD04) compressed game packets
 miniz_oxide = "0.8"
+# Build-time only: compiles resources/icon_*.ico into the Windows executables.
+winresource = "0.1"
 
 # aaemu-login: keep password hashing (PBKDF2 @ 600k iterations, sha256_crypt) usable in debug
 # builds and tests.
