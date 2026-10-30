@@ -666,7 +666,9 @@ the x2game / cry3dengine decompiles (addresses below). Config `Physics` (`Config
   `fallVel`: no damage when `min(v, √(40·Δh)) < 20 m/s`, else the client value capped at that
   speed. The client value is converted with 32000 / 63.25 units per m/s *(inferred from the C#
   curve)*. Swimming / hanging / attached units keep the client value (the movement path
-  `sub_39232570` forwards it). `FallDamageZoneCap = false` restores the C#.
+  `sub_39232570` forwards it). `FallDamageZoneCap = false` restores the C#, except for the
+  safe-speed gate and the never-negative damage of `do_fall_damage` (see the `systems::skills
+  (fall damage)` bullet below), which apply to every client value.
 * Movement verification (off by default): reasons 0, 11, 12, 15–17 and 19 are logged (no consumer).
   Deck-relative movement is composed through the live parent before collision proxy, terrain,
   water and verification queries. A vanished supporting object uses the packet's auxiliary
@@ -1516,6 +1518,34 @@ is no longer mirrored (see "Known deviations", dead NPC returned and healed).
   damaged again or HP is restored (resurrection, repair, load), so a repaired tower or a
   resurrected character still dies once per life. Tests:
   `systems::skills::death_once_tests` (two racing hits on a player / an NPC, looped).
+* systems::skills (fall damage, 2026-10-30): the C# `Unit.DoFallDamage` deals
+  `MaxHp * (fallVel - 8600) / 15000`, which is negative for every client `fallVel` from 1 to
+  8599, and `ReduceCurrentHp` applied `Hp = Max(Hp - value, 0)` to it (`Hp` is a plain property,
+  no `MaxHp` cap). So a small jump landing HEALED the unit, past `MaxHp`: in water, without a
+  physics world and with `FallDamageZoneCap` off the client value reaches `DoFallDamage`
+  unchanged (a bot was healed 237 hp by a jump landing in water). The C# carries
+  `TODO: Maybe adjust formula & need to detect water landing?`. The damage after `FallDamageMul`
+  could also go negative: the unit modifiers of that attribute (`unit_modifiers`, attribute 92)
+  are 8 buffs at -10 to -25 % and 3 items at -20 / -10 / +50 %, and they stack (the six -22 / -25
+  buffs alone add up to -135 %), which healed on every fall. Rust:
+  `do_fall_damage` deals no damage (and sends no `SCEnvDamagePacket`) up to
+  `pl_fallDamage_SpeedSafe` (20 m/s, `collision::fall::SPEED_SAFE`, the threshold of the zone's
+  own fall check; the client unit is the inferred 32000 / 63.25 per m/s, so `fallVel <= 10118`
+  is safe and 10119 hurts), clamps the damage after the multiplier at 0 (a fall cancelled to 0 neither stuns nor sends a packet), and keeps the C# curve
+  above the gate (`fallVel >= 32000` still kills, the 5 % floor and the stun are unchanged).
+  `reduce_current_hp` treats a negative damage value as 0 (a WARN; every caller passes a
+  positive value, heals use `effects::combat::heal`) and keeps the result in `[0, max_hp]` (a
+  unit whose `max_hp` is 0 is not capped). Water: neither the C# nor the data has a water rule
+  (the C# only carries the TODO above); the 1.2 zone's tracker skips swimming landings but its
+  movement path forwards a client fall velocity above 20 m/s, so water gets the same gate as
+  land and no deep-water exemption is implemented. **Needs capture** (real client in the water):
+  the `fallVel` and stance it sends when diving from a height. **Open:** the 10.x wire scale
+  is `u16 / 65535 * 128` m/s (`D:/aa-re/zone/agent_proto/zone_protocol.md`, 512 per m/s,
+  safe up to 10239) against the inferred 505.9 used here (also by the zone cap), unverified for
+  1.2; 185 `buffs` rows carry `fall_damage_immune` (human-cannon shields, ghost form, float-up
+  skills, the "immune to fall damage" buff), loaded into `BuffTemplate` but honoured by neither
+  the C# nor Rust. Tests: `systems::skills::fall_damage_tests`, `collision::fall::tests`,
+  `collision::flow_tests::a_landing_in_water_forwards_the_client_value_and_never_heals`.
 * systems::ai: calls into an NPC's AI from outside its tick (skills, aggro, npcs hooks) are queued and run right after the current AI step instead of re-entering it (`manager::post`); the AI tick runs on a blocking thread every ~100 ms; behaviour instances are kept per AI and accessed by kind. `UpdateAggroHelp` reaching a helper NPC without an AI logs and continues (the C# throws a `NullReferenceException` that cuts the whole behaviour tick short). `Npc.OnDamageReceived` on an AI-less NPC does nothing (C# NRE).
 * systems::ai: deletion marks an AI removed without waiting for its state mutex; the current holder detaches its owner and discards queued callbacks. This permits an NPC skill to delete its own caster and avoids the spawn-lock / AI-lock inversion during despawn. The global tick skips an AI whose state mutex is busy and retries on the next tick, so one external AI call cannot freeze movement and combat for every NPC.
 * systems::ai physics: Jitter's narrow phase (`MprEpa`) and contact solver are replaced by a box-vs-heightmap-triangle SAT with one contact per triangle and sequential impulses (Jitter's default friction / bias); the integration itself is exact. One physics world per instance is created with the first ship (C# starts a thread per instance at boot). Add / remove / helm / driver changes go through the pending queue (next tick); hull damage, movement packets and transform writes are applied after the tick; readers use per-tick snapshots. Water is kept per world template and a cell's `object.dat` is ingested when the physics or a water query sees the cell loaded. A height lookup error counts as height 0 (the C# exception skips the rest of that ship's tick). A ship whose game object is gone is skipped. Ship–ship harpoon tow resolves an explicit hook basis among the ships simulated this tick.
@@ -1871,8 +1901,51 @@ is no longer mirrored (see "Known deviations", dead NPC returned and healed).
   `NextPhase`, a function group of the other template. NPC 10119 near Arach Hollow summons doodad
   5007, whose clout moved the Amber Boulder (4252) into 5007's `DoodadFuncFinal` phase. That
   deleted the boulder, so quest 3447 "Fellow Searchers" could not be completed. 991 clouts use
-  the origin source and 602 of them have a next phase. The borrowed doodad is still the trigger
-  origin, but the task now changes the phase of the doodad that owns the clout.
+  the origin source and 602 of them have a next phase. The task now changes the phase of the
+  doodad that owns the clout.
+
+* systems::npcs (2026-10-30): a `DoodadFuncClout` whose doodad is initialised before its `Spawn`
+  (the `SummonDoodad` path runs `InitDoodad` first, then `Spawn`) keeps that doodad as the area
+  trigger origin even with `UseOriginSource`. The C# anchor moved the area to the first doodad
+  within 4 m of the caster; when a planted crop stood next to the caster of Comet's Boon (skill
+  18222, summoned doodad 5017), the caster sat 2.002 m off the clout's 2.0 m half-length and
+  buff 3771 was never applied, leaving the doodad's speed trail without its buff. Already
+  spawned doodads keep the C# anchor. `Unit.DecrementTriggerCount` now clamps at 0 as the C#
+  `Unit.DecrementTriggerCount` does: a clout with `NextPhase == -1` is removed by the doodad
+  delete and again by its task, and the former -1 suppressed the buff of the next clout on the
+  same unit.
+
+* systems::npcs (2026-10-30): `SpecialType.SpawnDoodad` with `value2 > 0` runs `InitDoodad()`
+  and then `Spawn()` together when the delay expires (a doodad task), instead of initialising
+  at the cast and spawning from a bare tokio task. The C# order (`InitDoodad(); if (delay > 0)
+  Thread.Sleep(delay); Spawn()`) is kept inside that step: the start phase runs on the still
+  invisible doodad, so no viewer gets a phase change of its init, and the area trigger of a
+  clout is first ticked after the spawn (the tick needs the owner's region, which `Spawn`
+  assigns after it made the owner visible). Deviation: the init moved from the cast to the end
+  of the delay. The port's delayed spawn ran on the task runtime, and a clout whose `duration`
+  was shorter than `value2` ended (and deleted the doodad) while it was still pending. The
+  start phase now starts at the spawn, so e.g. the clout of a `SpawnDoodad` summon is applied
+  for its full duration after the doodad appears (the C# phase tasks were scheduled at the
+  cast, so an over-due clout task fired right after the spawn). The owner unit that
+  `InitDoodad()` hands to the phase (`ParentWorld.GetUnit(OwnerObjId)`; `DoodadFuncClout` takes
+  `areaTrigger.Caster = caster is Character ? caster : owner` from it) is taken at the cast, as
+  the C# init ran there: a caster who leaves during the delay still owns the clout, whose
+  target relation is not judged against the doodad instead. A delayed spawn that can no longer
+  run (its instance is gone) releases the doodad's object id, which nothing else owns.
+
+* systems::npcs (2026-10-30): an `AreaTrigger` is removed once. `RemoveAreaTrigger` drops the
+  trigger from its owner's `AttachAreaTriggers`; the C# ran `OnDelete` again on every removal
+  and left the trigger attached until the owner doodad was deleted. A clout with `NextPhase ==
+  -1` is removed by both `Doodad.Delete` and its `DoodadFuncCloutTask`, and two casters' comets
+  over one ally share the buff's trigger count: the duplicate `OnDelete` decremented it twice,
+  so the ally lost the buff when the first clout ended. The first removal now marks the trigger
+  removed and takes its `Units`; a repeated removal does nothing. A removed trigger is neither
+  ticked nor entered again, although the manager keeps it in its list until the end of the next
+  tick: its owner can stay visible (a clout with `NextPhase != -1`, or the doodad a
+  `UseOriginSource` clout borrowed), and an update would count every unit inside once more and
+  re-apply the buff, which nothing removes afterwards. A removal that lands while `UpdateUnits`
+  applies its enters and leaves (the doodad task runtime and the area tick run on different
+  threads) leaves releasing the counted units to that update.
 
 * systems::vehicles / managers::item (2026-10-15): the shared death hook ignores self-deaths
   of objects other than characters and mates instead of reporting a missing mate owner. A mate
@@ -2515,29 +2588,43 @@ Additional world-side fixes from the same audit:
   the hull and would otherwise overlap its collision box (CryPhysics then ejects a freshly
   summoned hull). The exclusion is keyed on `doodad_owner_type::SLAVE` and therefore also
   covers cart equipment.
-* Summon placement probes the collision-world ground (`ground_height_probe`, mask
-  static+terrain) at the candidate centre and around the hull footprint instead of trusting
-  the heightmap alone; a probe miss (`Some(None)`) falls back to the terrain elevation (then
-  the heightmap) rather than "bottomless water". The probes use the hull footprint the solid
-  CryPhysics hull uses (the clipped authored collision bounds, else the mass box; scale 1.0
-  for a fresh summon) at the ship's FINAL yaw (owner yaw + 90°), sampled at the asymmetric
-  bow/stern extents, the longitudinal midpoint and both beam edges, so the middle of the long
-  sides is covered; the forward search still moves the centre along the player's facing.
-  Overhead structures are checked separately: a downward ray from above the hull envelope
-  (clipped bounds top + 1 m margin) to just above the water surface at every probe point
-  rejects a spot under a pier, bridge or deck as if it were shallow. A ray does not hit the
-  solid it starts in, so a second ray runs up the same segment and finds the underside of a
-  deck thick enough to contain the downward ray's start
-  (`collision::flow_tests::summon_overhead_clearance_sees_a_deck_that_contains_the_ray_start`).
-  If no forward candidate
-  is acceptable, the spot 5 m in front of the owner is used when it clears the same depth and
-  clearance tests (its centre only; no further placement search), placed at the water surface
-  there rather than at the owner's z (a pier or deck must not leave the hull in the air).
-  Remaining limitations: the checks sample points, not the whole hull volume; when every
-  candidate and the fallback fail, the C# initial spot is still used; and the terrain fallback
-  can read a harbour platform above the water (heightmap) even where the collision world is
-  open water, so the search may not move off a pier.
-
+* Summon placement. Player item summons (`SpawnSlave` / skill 15802, item use) follow the 1.2
+  client's own pre-cast search (`FUN_39347fb0`), a deviation from the C# `Create` placement:
+  120 candidates at `spawn_x_offset + i` metres forward along the player's facing (i = 0..39)
+  with lateral offsets `{0, +spawn_y_offset, -spawn_y_offset}`; the first passing candidate
+  wins. A candidate passes when (ships) the collision terrain is not above the water surface at
+  x/y, (land) the terrain is at most 10 m above the player, a ray from the player's eyes to the
+  candidate hits nothing (mask `SOLID_TERRAIN` 0x107, flags 0x8F; ships end at the water surface,
+  land at the candidate's own ground + 1 m, i.e. the 1.2 eye-to-eye rule), the model box (the
+  unclipped model bbox from the prefab collision proxies; the inertia mass box of the ship model
+  when the model reference is unavailable, e.g. no client assets) rotated to player yaw + 90
+  degrees overlaps no blocking static and no terrain heightfield, and the 3D player-to-candidate
+  distance is at most 80 m. The land candidate z is the static-aware ground (`ground_height_or`:
+  bridges, plazas, quays, then the heightmap), and the final spawn re-grounds a positioned land
+  slave the same way, so a vehicle on a bridge or quay does not sink to the terrain below it.
+  The box is an oriented `PrimitiveWorldIntersection` query (`box_obstacles`) for statics plus
+  `box_overlaps_terrain` for the heightfield (the PWI box query does not report heightfield
+  contacts); this 1.2 path has no +1 m top margin, no terrain point sampling and no
+  containment rays. Statics with a world AABB under 2 m (buoys, bollards, mooring posts) and
+  vegetation are ignored. If none of the 120 passes, the summon is refused with `SCErrorMsg`
+  100 (`SLAVE_SPAWN_SHIP_NEED_MORE_SPACE`), the summon item is not committed, the skill
+  cooldown and GCD are refunded — on the server and on the client with the same
+  `SCSkillCooldownResetPacket` the skill system uses — (also when a client `SummonPos` placement
+  fails the data-range or water checks with `SCErrorMsg` 583), and nothing is spawned. A client
+  `SummonPos` placement is validated with the same 1.2 checks instead of searching (the old
+  data-range and water sanity checks still run first). The old C# depth/overhead probes, the +1 m margin, the
+  nine-point terrain sampling and the containment rays remain in `hull_clear_at` only for GM
+  `/slave spawn` and spawner placement (no item), and its overhead probe now casts down and up
+  the same segment: the upward ray finds the underside of a deck thick enough to contain the
+  downward ray's start (`collision::flow_tests::summon_overhead_clearance_sees_a_deck_that_contains_the_ray_start`);
+  the player 1.2 model box rejects the same thick deck through the static/heightfield overlap.
+  Remaining limitations: the box-box intersect emits only clipped edge points, so a static
+  wholly inside the model box is not reported on this path (the old containment rays are
+  GM-only); land slaves use the terrain step and line of sight, not a vehicle-model box (only
+  ship models are loaded); and without a collision world (tests, Physics off) player placement
+  falls back to the C# in-front placement. `Physics:SummonDiagnostics` (Rust only, default
+  off) keeps scanning all 120 candidates after the first valid one and logs the 1.2 model box
+  against the old hull envelope per candidate (debug only).
 Remaining packet stubs and table candidates are still subject to behavior review. Missing SQL
 mentions do not establish disuse (some names are selected dynamically); empty tables, client
 visuals and schema migration metadata do not imply missing server features. The 10.x reference
@@ -2608,6 +2695,7 @@ See Docs/wiki/Quest-Audit.md and Docs/wiki/Mail-Audit.md.
 | Quest NPCs / doodads missing from every `*_spawns.json` | `app/Data/Worlds/{main_world,instance_library,instance_prologue,instance_nachashgar,instance_burntcastle_armory,arche_mall_world}`, `rust/tools/spawn_import/` | data | Positions from the 10.x pak (per-zone `npc_spawners.g`, per-cell `doodad.g`), the 1.2 `npc_spawner_npcs` rows and the git history of upstream spawn JSON. A position is imported only when it sits on the 1.2 heightmap (`|dz| <= 5 m`, ignored test `dump_terrain_heights`), next to an existing spawn of the same world (`<= 40 m`, `|dz| <= 8 m`: interiors, caves, bridges) or on clipped ground (heights are `u16 / 64`, so ground above 1024 m reads 1024) of a zone/frame verified by its other candidates. Editor-tier positions win over git-only ones. Imported: main_world 181 NPC / 58 doodad entries, instance_library 131 doodads, instance_prologue 8, instance_nachashgar 2, instance_burntcastle_armory 1, arche_mall_world 3 NPC / 1 doodad. Entries carry a `Title` naming the basis (the loader ignores it). |
 | Zones whose origin differs between the 1.2 and 10.x `world.xml` (190, 192, 193, 200, 227, 251, 266, 281, 286, 287) | same | data | The content sits at the 10.x position (zone origin x 1024 + local): the 1.2 origin never fits the 1.2 heightmap (0 of 154 editor candidates with unclipped terrain), the 10.x frame does (many points within 0.1 m). Z values above the 1024 m ceiling cannot be verified. Candidates whose terrain differs by tens of metres (10.x-only zones such as 157, parts of 190/281) were rejected. |
 | 10.x world spawns backported into 1.2 `main_world` | `app/Data/Worlds/main_world/{npc_spawns_10x,doodad_spawns_10x}.json`, `rust/tools/spawn_import/backport_10x.py` | data | Source: the 10.x `main_world` `npc_spawns.json` (28,434) / `doodad_spawns.json` (89,121). Filters in order: template id exists in the 1.2 compact (NPC -2,563, doodad -8,200); 10.x `Title` equals the 1.2 `en_us` name (ids were reused: NPC -2,202, doodad -60); the X/Y lies in a non-zero 1.2 `world.xml` zone (doodad -1,618); excluded doodad names `Restricted Area: Under Construction` (1,105) and `Sunken Treasure Chest` (1,323; no 1.2 system); the terrain rule of the October 17 import (`|dz| <= 5 m` to the 1.2 heightmap, or within 40 m / 8 m of an existing 1.2 spawn, or clipped ground; NPC -256, doodad -10,995) after the match; a one-to-one match per template before the terrain rule: each 10.x entry is paired, greedily by ascending XY distance, with the nearest unmatched existing 1.2 spawn of the same template within 20 m (NPC) / 10 m (doodad) and dropped (NPC -22,828, doodad -30,481), so shifted copies of an existing pack are not doubled and only the surplus survives; 10.x entries within 2 m of each other then collapse (NPC -6, doodad -3,677). Result: 579 NPC and 31,662 doodad entries. The NPC entries and the 670 mining veins (645 Iron Vein, 25 Starshard Vein) ship (the loader's `npc_spawns*.json` / `doodad_spawns*.json` glob reads them; they carry `Title`). The 10.x source is a live-server snapshot: its other surviving doodads were mostly player-planted trees, crops, livestock and housing furniture, which share templates with natural spawns and cannot be told apart, so they were removed (2026-10-27). Zones whose 10.x terrain differs from 1.2 (e.g. most of Rookborne Basin, zone 270: 128 of 145 10.x Iron Veins sit 100-300 m off the 1.2 ground) are correctly rejected by the terrain rule, so that zone gains only 3 veins. Rerun steps are in the script docstring (the heightmap dump is the ignored test `dump_terrain_heights`). |
+| Quest 869 giver doodad missing from every spawn file | `app/Data/Worlds/main_world/doodad_spawns_quest_fill.json` | data | One entry: doodad 1137 "Unknown Crate", the giver of quest 869 "Treasure of the Towers" (Mahadevi, level 16, open zone). The position 19065.793, 8919.587, 352.82 from the 10.x `main_world` cell `018_008` `doodad.g` (type 1137) agrees to 0.0 m with the 10.x and 1.2 `map_data/doodad_map/e_mahadevi.dat` records (1137); yaw 66.9998 degrees comes from the 10.x quaternion `(0, 0, 0.551936, 0.833887)`; the position lies in open zone 196 (`e_mahadevi_2`), whose `world.xml` origin is identical in 1.2 and 10.x. The raw 1.2 heightmap reads 241.78 m there, the 1.2 navmesh (the live `GeoDataMode` height path) 352.81982 m, 0.0002 m from the spawn Z; the ignored test `real_data_quest_fill_spawns_on_terrain` re-checks the loaded spawn, the open zone and that height. Excluded: 22 NPCs whose 10.x spawner placement and 10.x `npc_map` record agree within 0.5 m but whose quests are in zones closed in 1.2 (Airain Rock 192/193, Sunbite Wilds 157/190, Cradle of Genesis 328, Golden Ruins 281/203, Mistmerrow 307) or are test/dummy (Maisky 13877, Sephvell 14147); the open-zone missing NPCs without a position in both sources (Tame Yata 3450, Asam 1266, Freeblood Maurauder 1772, Trafficker Pirate 12509 and the other one-source/no-source NPCs); library doodads 7992/7993/7994 (level 51-55 later-patch content) and the remaining missing doodads 1082, 2770, 6197, 7404, 4380 (no `doodad.g` + `doodad_map` pair); all missing entities with no 10.x position at all (the majority of the 179 candidates). |
 | `NpcSpawner.SelectSpawnerId` for NORMAL multi-member spawners | `systems/npcs/npc/spawner.rs` (`select_spawner_id`) | matches the C# | Not changed. A JSON entry clones every game-data spawner that has its unit as a member and (memberwise clone) shares one `NpcSpawnerIds` list, so with more than one spawner only an AUTOCREATED unscheduled one or a scheduled one is ever selected: a unit that has no JSON entry of its own and is only a sibling of a NORMAL group spawner (Vicious/Silent Treant 3105/3106, Goblin Fighter 527, ...) never spawns. The 13 audit findings of this kind are all `ConAcceptNpcKill` starters, which `starter_accepts` evaluates as an OR over the component's acts, and in every one of the 7 quests other listed NPCs spawn, so no quest is blocked; the data would need real positions for these units (the 10.x editor has no placement of those group spawners). |
 
 ### `RedeemBuff` special effect (type 44)
