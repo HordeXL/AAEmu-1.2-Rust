@@ -166,7 +166,7 @@ Each subsystem records its status here, in its own section only (see `CONTRIBUTI
 | `Skills/Effects/SpecialEffects/*` (141 named `SpecialType` actions), `BubbleEffect`, `ImpulseEffect`, `PhysicalExplosionEffect` | `systems/skills/effects/{special/*,unit_fx}.rs`, `packets_special.rs` | partial | Ported actions and subsystem hooks are present, but historical logging placeholders do not establish gameplay completeness. Buff stealing, component-selective aggro copy/reset, target loss, NPC despawn, ongoing-buff cancellation and pet recovery now execute. ExplodeBuff, MoveToGround and RedeemBuff now execute (see below). Client visuals use the existing skill/plot notifications. 13 extra S->C packets, byte-exact tests. |
 | `Skills/SkillControllers/{Floating,Wandering,Leap,Dash,Rotate}` | `systems/skills/controllers.rs` | partial | Rotate uses native constructor/tick timing (`0x3924E1D0` / `0x392315C0`) with 1.2 controller7678 regression coverage. Generic Anchor and Flowgraph remain unverified; native 10.x Anchor parameter kinds1001..1039 differ from the 1.2 data kinds1..3. Harpoon ropes have a separate vehicles implementation. |
 | Movement hooks (`CSMoveUnit.RemoveEffects`, `Character.SetPosition` Move removal, fall damage) | `systems/skills/mod.rs` (`on_move_request`, `on_moved`) | done | Called from `world::session::move_unit`. |
-| `Skill.EndChanneling` target buff (`ChannelingTargetBuffId`) | `systems/skills/{skill,buffs}.rs` (`end_channeling`, `finish_effect_by_skill`) | deviation | **Deviation:** the C# `Buffs.RemoveEffect(templateId, skillId)` raised the buff's `OnTimeout` triggers on every removal; the Rust removal skips them for explicit removals (dispels, a stopped channel; see the FISH escape in `buff_removal_tests.rs`). Quest item grants hang on that trigger (GainItem on buff 3896 of skill 18449 'Extract Earth Crystal', 4 s channel under a 6 s buff, and the other channeling-target-buff quest skills of the item triage), so a channel that **runs to its end** now fires the target buff's Timeout triggers before removing it. A stopped / cancelled channel fires nothing (the C# granted the item then too). The caster-side `ChannelingBuffId` and buffs applied by skill effects (buff 1963 of 'Capture Crayfish') are unchanged: the latter expire on their own timer and fire Timeout already. |
+| `Skill.EndChanneling` target buff (`ChannelingTargetBuffId`) | `systems/skills/{skill,buffs}.rs` (`end_channeling`, `finish_effect_by_skill`) | deviation | **Deviation:** the C# `Buffs.RemoveEffect(templateId, skillId)` raised the buff's `OnTimeout` triggers on every removal; the Rust removal skips them for explicit removals (dispels, a stopped channel; see the FISH escape in `buff_removal_tests.rs`). Quest item grants hang on that trigger (GainItem on buff 3896 of skill 18449 'Extract Earth Crystal', 4 s channel under a 6 s buff, and the other channeling-target-buff quest skills of the item triage), so a channel that **runs to its end** now ends the target buff the way its own timer would (ACTING -> FINISHED, Timeout triggers, removal). The data pairs a channel with a target buff of the very same length in 18 skills with a Timeout trigger (e.g. 14054 'Insert Anima Into Stopped Machine', buff 1728, 5 s each), so the buff's own timer and the end of the channel reach the Timeout together; taking the buff from ACTING is an atomic claim (`finish_effect_by_skill`, `schedule_effect`), the loser leaves the buff alone, and the Timeout runs once (before, a second `GainItem` or `NpcControlEffect` followed in about one channel in ten: `integration_tests::channel_and_target_buff_ending_together_fire_the_timeout_trigger_once`). A stopped / cancelled channel fires nothing (the C# granted the item then too). The caster-side `ChannelingBuffId` and buffs applied by skill effects (buff 1963 of 'Capture Crayfish') are unchanged: the latter expire on their own timer and fire Timeout already. |
 
 #### Raw attribute bounds and permanent pStats (2026-10-25)
 
@@ -234,7 +234,7 @@ These `SpecialType` bodies were TODO stubs that only logged in the C# (`git show
 | `NpcManager.Load` (customs, body parts, templates, equip packs, postures, unit modifiers, initial buffs, merchants / goods) | `npc/data.rs` | done | 13 382 templates on the real DB. Creatures.xml names, `LoadAiParams` not ported. |
 | `NpcManager.Create`, `LoadCustom` (.NET `Random(123456789)` parity), `Npc` stats (Str..KillExp from the unit formulas + template bonuses), `InitializeSpawnBuffs`, `AnimActionId` | `npc/manager.rs`, `npc/stats.rs` | done | Every real template creates without error. The AI is created through `server.systems.hooks.ai` (`systems::ai`). |
 | `Npc.DoDie` | `npc/death.rs` | done | Kill exp (team eligibility, `PlayerExpModifier`, mate exp, TagShare contributors), quest kill events, loot (`LootManager.GenerateLoot` through the economy), aggro / tagger clean-up, spawner despawn, `Ai.GoToDead()` (`systems::ai`). |
-| NPC interaction packets (CSStartInteraction, CSInteractNPC(End), CSSelectInteractionEx; SCNpcInteractionSkillList, SCAiAggro, SCNpcChatMessage, SCUnitModelPostureChanged, SCAggroTargetChanged) | `npc/packets.rs` | done | Byte-exact tests. Merchant / bank / auction UIs are economy's. |
+| NPC interaction packets (CSStartInteraction, CSInteractNPC(End), CSSelectInteractionEx; SCNpcInteractionSkillList, SCAiAggro, SCNpcChatMessage, SCUnitModelPostureChanged, SCAggroTargetChanged) | `npc/packets.rs` | done | Byte-exact tests. Merchant / bank / auction UIs are economy's. **Deviation:** `CSStartInteractionPacket` also answers a slave with skill 12076 (occupy), so the 1.2 client's first-skill path (`FUN_393be850` / `FUN_393bf310`) sends `CSBindSlave` 0x031 (bound by `vehicles::slaves::bind_slave_by_tl`); the C# answered only NPCs and mates (12077). |
 | `NpcGameData` (npc_spawners, npc_spawner_npcs, member index, generated spawners) | `npc/spawner_data.rs` | done | |
 | `NpcSpawner`, `NpcSpawnerNpc`, `DoodadSpawner`, `Spawner<T>` | `npc/spawner.rs`, `doodad/spawner.rs` | done | Schedules / time windows / population caches, respawn + despawn timing, exact-identity reconciliation of direct deletes (see deviations). Ordinary populations keep the authored `Count` / `min_population` baseline (default 1) and per-slot respawn deadlines (see deviations). AI home position / follow path / simulation through `server.systems.hooks.ai` (`systems::ai`). |
 | `SpawnManager` (one per instance) + `WorldManager.ActiveRegionTick` spawner part | `spawn_manager.rs` | done | main_world: 25 118 NPC entries -> 24 047 ordinary placements / 38 174 spawner clones (1 011 duplicates and 60 event entries filtered, 0 missing templates), 42 649 doodads, 69 transfers, 14 gimmicks, 5 slaves, 0 parse errors. Ordinary spawning is a bounded per-instance 64 m region-index activation pass (`World.NpcPrewarmRegionMargin` / `World.NpcSpawnTickMs` / `World.NpcSpawnsPerTick`) with warm retention and resident-service retention (`World.NpcWarmRetentionSeconds` / `World.NpcResidentServiceNpcs`; see deviations). Persistent doodads from MySQL. Transfers / slaves: `systems::vehicles`; houses and their doodads: `systems::housing`; trial court doodads / NPCs linked after the spawns (`TrialManager.Initialize*`). |
@@ -328,6 +328,28 @@ persisted state, not save order, and the process stop was forced, so the logs ar
 warning- or error-free. Independent cargo/SQL and control reviews support this
 bounded observation with that replacement-refusal qualification; wider audit items
 remain open.
+
+#### Stale saved cargo racks and client summon points (2026-10-28)
+
+Deviation from the C# `SlaveManager.Create`, which restored a rack's saved item reference
+unchecked: the saved-cargo preflight (`PersistentDoodads::validate_slave_cargo`) no longer
+refuses the summon forever when a rack's escrow pack is gone (no container holds the id) or is
+not the escrowed pack any more (moved out of System escrow, or the id was reused by an
+unrelated item). Such a rack is restored empty in its authored empty phase, the cleared row is
+persisted, and a warning names the rack and item ids; no item is granted, moved or deleted.
+Several holders of the id, an intact pack referenced by two racks or by a live rack of another
+hull, and a live-receipt mismatch still refuse. Such rows most likely date from before
+`a0a62dbf3`, when deleting a live rack ran `remove_expired_doodad_item` and removed the escrowed
+pack while the persistent rack row kept its reference; the surviving logs cannot prove it. Today
+cargo, rack and Slave references are retained by `cleanup_doodad_escrow_item`.
+
+Boat summon points are checked with `ship_physics::is_summon_water`: the client picks them on
+its wave-displaced sea 0.05-0.6 m above the nominal level (`z = 100.3` over ocean level
+100.0), which the strict `IsWater` (`z <= level`; the open ocean has no water volume) refused
+as "a ship must be summoned on water". A point up to `SUMMON_WATER_TOLERANCE` (1 m) above the
+water is accepted when the terrain under it is below the surface (so beaches stay land).
+Land-vehicle placement keeps the strict check. Real-data check (needs `AAEMU_GAME_PAK`):
+`cargo test -p aaemu-game real_water_boat_summon_points -- --ignored --nocapture`.
 
 ### systems::social
 
@@ -602,6 +624,34 @@ the x2game / cry3dengine decompiles (addresses below). Config `Physics` (`Config
   NPC spawner points snap to it within 1 m (`npc_spawn_on_terrain`). Real data: 1 487 of the 1 524
   NPC spawns of the 4 busiest main_world cells are within 1 m of the physics ground (1 407 of the
   terrain elevation alone; 178 stand on brushes).
+* **Deviation:** `npc_spawn_on_terrain` (`systems/npcs/npc/spawner.rs`, `spawn_ground_z`) snapped a
+  spawn to the ground only within 1 m. When the ground probe (2 m above the spawn, downwards) hits
+  a floor (terrain, a building, a cave floor) the spawn now snaps onto it when it is less than
+  `SPAWN_GROUND_SNAP` (5 m) above it (or sunk up to the probe's 2 m); spawns authored 1-5 m
+  above the ground (about 5 % of main_world) no longer float. Larger gaps (structures, sea-surface
+  swimmers, instance data) and probe misses (caves with no floor, no collision service) keep the
+  C# 1 m rule, with three additions: a spawn 1 m or more above a floor under the water surface
+  (a surface swimmer) stays; a probe miss under solid, non-hole terrain less than
+  `SPAWN_SINK_SNAP` (6 m) deep is lifted onto the terrain (the client drew it buried), and
+  anything under a hole stays; a floor at the heightmap ceiling (`max_height / 4` = 1024 m in
+  main_world, the u16 height storage saturates) is not trusted; a spawn 1 m or more above a floor
+  and inside the bounding box of a loaded brush at least 6 m tall (a building / castle shell,
+  `inside_brush_bounds`) keeps its Z: the Two Crowns throne hall (about 100 crowd NPCs at
+  Z 242.8 around 13575-13636, 10427-10475) has no floor in our collision (the stairs brush's slab
+  covers only a diagonal band, `castle_nuia_001` has no floor geometry), so the probe falls through
+  to the terrain 4 m below and a snap would sink them under the hall floor. Flying and `underwater_creature`
+  NPCs are not snapped.
+* **Terrain holes:** the 1.2 `heightmap.dat` marks cave / basement entrances with surface id 31
+  (`raw & 0x1F` of a node-v5 sample; `cry3dengine` `IsHole` 0x300CAB30: the containing sector's
+  lower sample, a node with fewer than 33 samples is read at `floor(i * (size - 1) / 32)`, shared
+  sector edges belong to the positive-side sector). `NodeCell.surface` keeps the ids (taken
+  before `RescaleToInt` drops the fifth bit), `WorldHeightmap` a per-cell hole bitmap
+  (`grid_is_hole`), and the physics heightfield's `getSurfType` returns the default `typemask`
+  bit for a hole, so rays pass through (`TerrainSource::is_hole`, `terrain_is_hole`). The
+  C# ignored the holes (and `GetTerrainElevation` still answers over a hole, as native does).
+  Real data: cells 20,8 / 21,8 / 8,13 have 7 / 3 / 2 leaves with `hasHoles` and SID 31
+  (`real_terrain_holes`). Unchanged and unfixed: the C# height decode `data >> 4` (12 bit) differs
+  from the native `raw & 0xFFE0` (mean 0.05 m, max 0.25 m on the measured cells).
   **Visibility deviation (systems::npcs / world::unit_state, 2026-10-11):** NPC unit-state packets
   preserve the spawn/movement transform instead of the C# serializer's `GetReferenceHeight`
   mutation. That mutation could replace a collision floor with a coarse navmesh plane or reset
@@ -1261,6 +1311,13 @@ is no longer mirrored (see "Known deviations", dead NPC returned and healed).
   `cast_validation_tests.rs` cover the height/mask/class rule, the radius gate, the 0.5 m
   position radius and the terrain gate. Not modelled: the multi-part target variant
   `FUN_3989DAE0` (loops the target's sub-shapes and passes if any part passes).
+  **Doodad targets are exempt** (2026-10-28): the client's cast target check for wire type 4
+  (`FUN_3939E030`, IDA `sub_3939E030`) only looks the doodad up, and `FUN_390B5540` (skill
+  result 0xC) is reached only for unit (`FUN_390B5C60`) and position (`FUN_390B5A30`) targets,
+  so a doodad's origin inside static map geometry (production: craft 6231 / skill 16766 at the
+  Two Crowns specialty bench, doodad 4235 at 13824.67 10604.76 120.54, whose ray always hit map
+  brush cell (13, 10)) must not refuse the interaction. This supersedes the earlier skip of
+  the owning house's collider for its fixtures.
 * systems::skills: the labor margin requirement uses `GetMaxLabor(Payment.PremiumState)`; every
   connection has the default C# `AccountPayment` (premium until 2030), so the cap is 5000.
 * systems::skills (in-place resurrection, 2026-10-20): `CSResurrectCharacterPacket(in_place =
@@ -1917,6 +1974,21 @@ is no longer mirrored (see "Known deviations", dead NPC returned and healed).
   `PostDate`) and a buyout sends `SCAuctionBidPacket` with `isBuyout = true`, the lot's
   `direct_money` and the buyer's identity (the C# buyout branch sent nothing although the 1.2
   packet carries the flag). Seller / item mail delivery is unchanged.
+* systems::skills (buff charges, 2026-10-28): `Buff.WriteData` (`SCBuffCreatedPacket`) already
+  carried the real `Charge` in the C# and does here; this is not a deviation. The deviation is
+  `SCUnitStatePacket.WriteBuff`, which hardcoded `tickIndex 0, stack 1, charged 0`. The 1.2
+  client's NetBuff serializer (`FUN_397c9230`) names that field `charged`, so a re-sent unit
+  state dropped remaining charges; Rust now writes the live `Buff.Charge`. `stack` stays 1 as
+  the C# `SCUnitStatePacket.WriteBuff` wrote it (the model has no per-effect stack counter:
+  stacks are separate effects, one row each); the 1.2 meaning of that field is not verified.
+  `tickIndex` stays 0 (the C# value; no source for another).
+  `SCBuffUpdatedPacket` (0x0b9, 15 bytes, client serializer `FUN_397c63f0`) is also new: the C#
+  had only the opcode constant and no sender. It is broadcast, to the same audience as
+  `SCBuffCreated` / `SCBuffRemoved`, when `Buff.ConsumeCharge` leaves a non-passive buff alive
+  (passive buffs send no buff packets), and not when the buff exits. Its `stack` is likewise 1
+  as the C# wrote it, meaning unverified. The send timing is inferred: no retail 1.2 server
+  capture exists, and whether 1.2 also sent it on refresh / duration change is unknown;
+  refreshes keep re-sending `SCBuffCreatedPacket` as before.
 * systems::economy (auction settlement, 2026-10-20): the C# ignored `MailForAuction.Send()`
   (`RemoveAuctionLotSold` / `RemoveAuctionLotFail` / `CancelAuctionLot` removed the lot anyway),
   so a mail that was not stored lost the seller's money or the buyer's item. Here a settlement
@@ -1967,6 +2039,14 @@ servers (see `rust/LIVE-TESTING.md`). Fixed porting bugs are in the git history 
 * Positions are saved with full `f32` precision. The C# (MySql.Data float parameters) stores
   them with ~6 significant digits (`15578.041` -> `15578.0`), so a re-login spawns a few cm away
   from where the C# would put it.
+* Vehicle / ship / transfer velocity shorts use the client's scale: `m/s = wire * 30 / 32767`
+  (1.2 `x2game.dll` type 2/3/5 movement readers; `_DAT_399abe78` = 1/32767,
+  `_DAT_3999f7c0` = 30.0), so 1 m/s is `32767/30` (~1092.2) wire units. The C# wrote ship
+  `VelX/Y/Z` with `const int velMultiplier = 2048` (`PhysicsManager.SendUpdatedMovementData`)
+  and `TransferData` read/wrote its velocity with a 50 factor (wire *655.3). The Rust ship
+  encoder and `TransferMove` now use the 30/32767 scale; positions and rotations are unchanged.
+  A live capture of the original client on 2026-10-29 measured 1/1092 on its own `CSMoveUnit`
+  type 2 bodies (ratio 0.994 at 1/1092 vs 1.864 at 1/2048, n=640).
 * `X2EnterWorldResponsePacket.token` (= game session id) is a counter (see above), so stream
   `CTJoin` tokens are small integers rather than `RemoteEndPoint.GetHashCode()` values.
 * A character created in this session keeps its in-memory state until it is selected (as C#
@@ -2406,9 +2486,41 @@ Additional world-side fixes from the same audit:
 * Ship replication preserves the physical quaternion instead of rebuilding it through the
   legacy Euler conversion, including mixed yaw/tilt and positive-W packet reconstruction.
   Solid hull and bottom boxes use transformed authored collision-proxy bounds independently
-  of the inertia-only mass box. Native entity bounds can include render and non-brush objects
-  unavailable to this loader, so this is a documented proxy adaptation. Explicit buoyancy
-  settings remain authoritative; missing model assets retain the prior geometry fallback.
+  of the inertia-only mass box, keeping the authored length/beam (the Longliner's 14 m half
+  length). The bounds' z-range is clipped to the hull envelope at `add_ship`: the top is at
+  most the mass-box top + 1 m freeboard (`cry::HULL_FREEBOARD_METERS`) and the authored
+  bottom/draft is kept, so mast and rigging proxies of the "DEFAULT" union never become part
+  of the solid hull. Without the clip the union put the entity bounding box above the
+  waterline; the engine's water-area check then let the summoned Cutter sink until buoyancy
+  launched it. Native entity bounds can include render and non-brush objects unavailable to
+  this loader, so this is a documented proxy adaptation. Explicit buoyancy settings remain
+  authoritative; missing model assets retain the prior geometry fallback.
+* Doodads attached to a slave (masts, sails, cannons) get no world collider: they move with
+  the hull and would otherwise overlap its collision box (CryPhysics then ejects a freshly
+  summoned hull). The exclusion is keyed on `doodad_owner_type::SLAVE` and therefore also
+  covers cart equipment.
+* Summon placement probes the collision-world ground (`ground_height_probe`, mask
+  static+terrain) at the candidate centre and around the hull footprint instead of trusting
+  the heightmap alone; a probe miss (`Some(None)`) falls back to the terrain elevation (then
+  the heightmap) rather than "bottomless water". The probes use the hull footprint the solid
+  CryPhysics hull uses (the clipped authored collision bounds, else the mass box; scale 1.0
+  for a fresh summon) at the ship's FINAL yaw (owner yaw + 90°), sampled at the asymmetric
+  bow/stern extents, the longitudinal midpoint and both beam edges, so the middle of the long
+  sides is covered; the forward search still moves the centre along the player's facing.
+  Overhead structures are checked separately: a downward ray from above the hull envelope
+  (clipped bounds top + 1 m margin) to just above the water surface at every probe point
+  rejects a spot under a pier, bridge or deck as if it were shallow. A ray does not hit the
+  solid it starts in, so a second ray runs up the same segment and finds the underside of a
+  deck thick enough to contain the downward ray's start
+  (`collision::flow_tests::summon_overhead_clearance_sees_a_deck_that_contains_the_ray_start`).
+  If no forward candidate
+  is acceptable, the spot 5 m in front of the owner is used when it clears the same depth and
+  clearance tests (its centre only; no further placement search), placed at the water surface
+  there rather than at the owner's z (a pier or deck must not leave the hull in the air).
+  Remaining limitations: the checks sample points, not the whole hull volume; when every
+  candidate and the fallback fail, the C# initial spot is still used; and the terrain fallback
+  can read a harbour platform above the water (heightmap) even where the collision world is
+  open water, so the search may not move off a pier.
 
 Remaining packet stubs and table candidates are still subject to behavior review. Missing SQL
 mentions do not establish disuse (some names are selected dynamically); empty tables, client
@@ -2602,6 +2714,8 @@ The Bevy 1.2 client (`AABevy1.2`) is the main client; its reverse-engineering no
 | M10 | Bounty rows write `notGuilty` before `guilty` | verified: row reader `397bebf0` reads `notGuilty` (`+0xc8`) then `guilty` (`+0xcc`) |
 | M14 | `SCUnitState` of a character sets flag bit3 (`0x0008`) while force attack is on, so late observers see Bloodlust | verified: the client chain is `397c9480` -> `398a1f90` -> unit+0x3bbc (the force-attack byte) for bit3 of the `u16` flags |
 | M15 | `SCCooldowns` has a full writer (`i32` count + `[id, total, remaining]` u32 triples, skills then tags, 150 per list) and is sent after `SCCharacterState` when the character has running skill cooldowns. The server keeps only the end time of a skill cooldown and no tags, so `total` equals `remaining` | verified: `397b64d0` -> `397b2350`; entries are appended, an empty list is no reset. Cooldowns are not persisted, so a freshly loaded character normally has none |
+| M24 | Slave-equipment items (`item_impl` 28, e.g. item 29725 on slave template 21) are written as detail type 0 (`Invalid`) with no detail body; the server no longer sends `ItemDetailType.SlaveEquipment` (10, 12 opaque bytes), which desynced every field after the item (the Bevy client rejected `SCUnitStatePacket` 0x069 and the original 1.2 client misparsed it) | verified: the 1.2 item detail reader `3961edf0` has cases only for tags 1..9 (bodies `0x38, 0x1e, 7, 10, 0x19, 0x11, 0x11, 9, 5` minus the type byte) and no case 10, so tag 10 reads no body; the C# 1.2 `ItemDetailType` numbering has no 10 either |
+| M25 | `SCUnitState` `Inventory_Equip` for slaves writes full items in slots 19..25 (the C# wrote only the template id for every unit type). A hull part there (Harpoon Clipper, template 14, part 29742 in slot 23) made the original 1.2 client read the following bytes as item fields and run off the packet (`sc error; cur=105 prev=97`, `Packet Error !!!`); Housing (3), Mate (5) and Character (0) keep template-only body parts, Npc (1) keeps `templateId, id, grade` outside 19..25 with a full-item Cosplay slot (27), Transfer/Shipyard write only 19..25 | verified: the client equipment reader `3961fa20` reads 19..25 as a template-only `u32` only when `baseUnitType != 2`; for a slave every slot goes through the full item reader `3961f500` |
 | CS | The client CS table entries missing from `opcodes::cs` were added: `0x11f CSRequestSetBountyMoney`, `0x120 CSSendBountyUpdate`, `0x130 CSRankSnapshot` (already handled through a local const, now the table entry), `0x133 CSChangeAutoUseAAPoint` | the Bevy `opcodes.rs` (client table); 0x130 additionally by the RE notes in `ranking_packets.rs`. `0x11f`/`0x120` are logged no-ops (the bounty ledger is not wired to the wallet, TODO); `0x133` sets `Character.auto_use_aa_point` and answers with `SCItemTaskSuccess` (`ItemTaskType` 110 carrying the one-byte `ChangeAutoUseAAPoint` task, action 18); the 1.2 C# had the task class but no 0x133 handler, so this reply is inferred, not observed on a live client |
 
 Doc-only items:
@@ -2814,6 +2928,16 @@ running in place). Four mirrored C# bugs and one missing safeguard:
   starts the simulation for an NPC without an AI; the AI runs the FollowPath / UseSkill / Timeout
   commands itself. Test: `flow_tests::run_command_set_effect_does_not_start_the_simulation_mover_for_an_ai_npc`.
 
+* `NpcControlEffect` `FollowPath` (and the no-AI `RunCommandSet` route) checked and set `IsInPatrol`
+  in two steps. The effect can reach an NPC twice at once (Timeout trigger of a channeling
+  target buff: the buff's timer and the end of the channel), and a second caller that passed the
+  check ran `Simulation.GoToPath` again, which toggles `MoveToPathEnabled` back off: the walk
+  stopped at once (6-9 of 400 simultaneous deliveries). The check-and-set is one step now
+  (`hooks::begin_patrol`). Test: `flow_tests::follow_path_effect_arriving_twice_at_once_starts_the_walk_once`;
+  the whole quest 2423 'The Windwhips' Chest' chain (Anima Injector -> buff 1728 -> route
+  `q2423_fm_tige` -> Suspicious Chest 2906 -> Metal Cylinder) is pinned on the real tables by
+  `skills::quest_machine_flow_tests` (`AAEMU_COMPACT_DB`).
+
 `flow_tests::follow_path_command_set_walks_every_route_point` runs the real command-set shape
 over three routes with an elevated point and checks every point is targeted in order, the set
 finishes and the NPC settles in HoldPosition without further movement.
@@ -2896,10 +3020,13 @@ the real `parse_list` and checks the eight placements.
   `SCUnitEquipmentsChanged`, followed by `SCUnitPoints` when a part carries MaxHealth. Item
   tasks go through the economy's `SplitOrMoveItemEx` (`ItemTaskType.Invalid`, as in C#), and the
   slave model mirror is refreshed before `UpdateGearBonuses` / pool refresh.
-- **Ship parts.** Items with `item_impl = 28` (`ItemImplEnum.SlaveEquipment`) are now
-  `ItemClass::SlaveEquipment` with `ItemDetailType.SlaveEquipment` (12 opaque detail bytes);
-  `read_wire_item` consumes detail bytes by detail type (gear 55, ship parts 12, ...) instead of
-  always reading an `EquipItem`. Bind-on-equip applies in `EquipmentSlave` too. A player-owned
+- **Ship parts.** Items with `item_impl = 28` (`ItemImplEnum.SlaveEquipment`) are
+  `ItemClass::SlaveEquipment`, but the 1.2 client has no detail type 10: its item detail reader
+  `3961edf0` only has cases 1..9, and reads no body for tag 10 (the C# `SlaveEquipment = 10` is
+  for later clients). The server therefore sends them as detail type 0 (`Invalid`) with no body,
+  like every other class without a 1.2 detail; `read_wire_item` consumes detail bytes by detail
+  type (gear 55, ...) instead of always reading an `EquipItem`. Bind-on-equip applies in
+  `EquipmentSlave` too. A player-owned
   slave gets its starter pack when its equipment container is first created, including a saved
   legacy hull whose summon item already names its DB id. An existing empty container represents
   intentional unequipping and is reused on the next summon / restart without seeding again.

@@ -316,7 +316,19 @@ pub(super) fn check(
     if distance > max_range + extent && !unbounded_placement {
         return fail("skill_too_far_range");
     }
-    if template.check_obstacle && !target.as_obj().is_some_and(|o| o.same(caster)) {
+    // The 1.2 client never runs the obstacle ray for a doodad target: the cast target check for
+    // wire type 4 (`FUN_3939E030`, IDA `sub_3939E030`, `x2game12.c:765943`) only looks the doodad
+    // up (result 9 when it is gone), while the one producer of skill result 0xC (`FUN_390B5540`)
+    // is reached only for unit (`FUN_390B5C60`) and position (`FUN_390B5A30`) targets, and unit
+    // ids never resolve to doodads. A doodad's origin also sits on or inside static map
+    // geometry (workbench stalls, house fixtures, objects baked into a brush), so the ray
+    // always hit that geometry and refused the interaction ("Too far from target"). The
+    // retail zone does not check obstacles either and the C# tree had no check at all.
+    if template.check_obstacle
+        && !target
+            .as_obj()
+            .is_some_and(|o| o.same(caster) || o.as_doodad().is_some())
+    {
         // 1.2 client `FUN_390B5650` (x2game.dll.c:149951): shorten the end point by the
         // target radius and cast no ray when `dist <= radius`; `FUN_390B5540`
         // (x2game.dll.c:149877) uses objtypes 7 (0x107 with `check_terrain`), ray flags

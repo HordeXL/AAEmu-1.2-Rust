@@ -885,17 +885,15 @@ async fn obstacle_checks_reject_a_physical_wall_before_any_cast_mutation() {
         "terrain beneath a crop must not block harvesting"
     );
     crop.data().transform.set_xyz(100.0, 105.0, 100.0);
-    assert_eq!(
+    assert!(
         super::validation::check(
             &server,
             &crop_skill,
             &WorldObject::from(&player),
             &crop_target
         )
-        .unwrap_err()
-        .0,
-        skill_result::OBSTACLE,
-        "walls still block doodad interactions"
+        .is_ok(),
+        "the client runs no obstacle ray for doodad targets, walls included"
     );
     let skill = SkillRun::new(
         Arc::new(SkillTemplate {
@@ -915,6 +913,99 @@ async fn obstacle_checks_reject_a_physical_wall_before_any_cast_mutation() {
     // Disabling the configured check retains the explicit template behavior.
     let skill = SkillRun::new(Arc::new(super::tests::skill_template(2)), 1);
     assert_eq!(cast(&server, &skill, &player, &npc).0, 0);
+}
+
+/// Crafting benches and other doodads sit on or inside static map geometry (a brush baked
+/// into the map, or a house mesh): the 1.2 client's cast target check for a doodad
+/// (`FUN_3939E030`, wire target type 4) only looks the doodad up and never casts the obstacle
+/// ray, so the geometry around the doodad's origin must not refuse the interaction. Unit targets
+/// behind the same geometry are still blocked (`FUN_390B5C60`). Production: craft 6231 at the
+/// Two Crowns specialty bench (doodad 4235, skill 16766) was refused with `OBSTACLE` because the
+/// ray to the bench origin always hit map brush cell (13, 10).
+#[tokio::test]
+async fn obstacle_ray_is_not_cast_at_doodad_targets() {
+    use crate::systems::ai::collision::models::{ModelPart, ModelPhys};
+    use crate::systems::ai::collision::world::{CellContent, StaticInstance};
+    use aaemu_physics::geometry::primitives::{BoxPrim, Primitive};
+    use aaemu_physics::math::{Quat, Vec3};
+    struct Ground;
+    impl crate::systems::ai::collision::terrain::TerrainSource for Ground {
+        fn sample(&self, _x: i32, _y: i32) -> f32 {
+            100.1
+        }
+        fn size(&self) -> (i32, i32) {
+            (1024, 1024)
+        }
+    }
+    let (server, _client, player, npc) = fixture(GameData::empty());
+    server
+        .systems
+        .ai
+        .collision
+        .test_files
+        .set(Arc::new(std::collections::HashMap::new()))
+        .unwrap();
+    server
+        .systems
+        .ai
+        .collision
+        .test_terrain
+        .set(Arc::new(Ground))
+        .unwrap_or_else(|_| panic!("terrain"));
+    let physics = crate::systems::ai::collision::phys_world(&server, 0).unwrap();
+    let geometry = physics
+        .lock()
+        .world
+        .register_primitive(&Primitive::Box(BoxPrim::aligned(
+            Vec3::ZERO,
+            Vec3::new(1.0, 0.1, 1.0),
+        )))
+        .unwrap();
+    // A static brush between the caster (y 100) and the targets (y 105).
+    physics.lock().insert_cell(CellContent {
+        cell: (0, 0),
+        instances: vec![StaticInstance {
+            model: Arc::new(ModelPhys {
+                path: "test/bench-brush.cgf".into(),
+                parts: vec![ModelPart {
+                    slot: 0,
+                    geom: geometry,
+                }],
+                blob_bytes: 0,
+            }),
+            pos: Vec3::new(100.0, 102.5, 101.0),
+            q: Quat::IDENTITY,
+            scale: 1.0,
+            flags_default: 0x18fff,
+            density: 0.0,
+            ent_flags_or: 0x8000,
+            vegetation: false,
+        }],
+        ..Default::default()
+    });
+    let mut bench = crate::models::doodad::Doodad::new(4235);
+    bench.transform.set_xyz(100.0, 105.0, 100.0);
+    let bench = Entity::new(0x300, bench);
+    let skill = SkillRun::new(
+        Arc::new(SkillTemplate {
+            check_obstacle: true,
+            target_type: super::types::SkillTargetType::Doodad as i32,
+            ..super::tests::skill_template(3)
+        }),
+        1,
+    );
+    let check = |target: Target| {
+        super::validation::check(&server, &skill, &WorldObject::from(&player), &target)
+    };
+    assert_eq!(
+        check(Target::Obj(WorldObject::from(&npc))).unwrap_err().0,
+        skill_result::OBSTACLE,
+        "the brush blocks a unit target behind it"
+    );
+    assert!(
+        check(Target::Obj(WorldObject::from(&bench))).is_ok(),
+        "the brush must not refuse the interaction with a doodad behind it"
+    );
 }
 
 /// 1.2 client `FUN_390B5540` (`x2game.dll.c:149877`): the obstacle ray runs at unit
@@ -945,7 +1036,7 @@ async fn obstacle_ray_matches_the_retail_height_mask_and_collision_class() {
         source_z: f32,
         target_z: f32,
     ) -> Result<(), (u8, u32)> {
-        let (server, _client, player, _npc) = fixture(GameData::empty());
+        let (server, _client, player, npc) = fixture(GameData::empty());
         server
             .systems
             .ai
@@ -991,20 +1082,18 @@ async fn obstacle_ray_matches_the_retail_height_mask_and_collision_class() {
             ..Default::default()
         });
         player.data().unit.transform.set_xyz(100.0, 100.0, source_z);
-        let mut crop = crate::models::doodad::Doodad::new(1);
-        crop.transform.set_xyz(100.0, 110.0, target_z);
-        let crop = Entity::new(0x300, crop);
-        let crop_target = Target::Obj(WorldObject::from(&crop));
+        // Doodad targets are exempt from the ray, so the target is a unit.
+        npc.data().unit.transform.set_xyz(100.0, 110.0, target_z);
+        let npc_target = Target::Obj(WorldObject::from(&npc));
         let skill = SkillRun::new(
             Arc::new(SkillTemplate {
                 check_obstacle: true,
                 check_terrain,
-                target_type: super::types::SkillTargetType::Doodad as i32,
                 ..super::tests::skill_template(3)
             }),
             1,
         );
-        super::validation::check(&server, &skill, &WorldObject::from(&player), &crop_target)
+        super::validation::check(&server, &skill, &WorldObject::from(&player), &npc_target)
     }
 
     // The old +1 m ray hit a wall above the feet; the retail ray at position height does not.

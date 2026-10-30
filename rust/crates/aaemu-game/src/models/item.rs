@@ -30,7 +30,6 @@ pub mod detail_type {
     pub const DECORATION: u8 = 7;
     pub const MUSIC_SHEET: u8 = 8;
     pub const GLIDER: u8 = 9;
-    pub const SLAVE_EQUIPMENT: u8 = 10;
     pub const LOCATION: u8 = 11;
     pub const TYPE_MAX: u8 = 12;
 }
@@ -61,7 +60,8 @@ pub enum ItemClass {
     SummonMate,
     SummonSlave,
     TreasureMap,
-    /// Ship / vehicle part (`item_impl` 28, `ItemDetailType.SlaveEquipment`).
+    /// Ship / vehicle part (`item_impl` 28). The 10.x `ItemDetailType.SlaveEquipment` detail
+    /// does not exist in the 1.2 client, so these items carry no wire detail body.
     SlaveEquipment,
 }
 
@@ -129,7 +129,10 @@ impl ItemClass {
             Self::SummonMate => detail_type::MATE,
             Self::SummonSlave => detail_type::SLAVE,
             Self::TreasureMap => detail_type::TREASURE,
-            Self::SlaveEquipment => detail_type::SLAVE_EQUIPMENT,
+            // 1.2 has no `ItemDetailType.SlaveEquipment` (the client item detail reader
+            // `3961edf0` only has cases 1..9), so ship parts go out as a plain item with no
+            // detail body.
+            Self::SlaveEquipment => detail_type::INVALID,
             _ => detail_type::INVALID,
         }
     }
@@ -144,27 +147,32 @@ impl ItemClass {
             Self::SummonMate => 6,
             Self::SummonSlave => 29,
             Self::TreasureMap => 24,
-            Self::SlaveEquipment => 12,
             _ => 0,
         }
     }
 }
 
+/// Detail body lengths after the type byte, indexed by `ItemDetailType`: exactly the switch
+/// cases of the 1.2 client's item detail reader `3961edf0`. There is no case 10
+/// (`SlaveEquipment`, later clients only) and no case 11 (`Location`): both read no body.
+const DETAIL_BODY_LENS: [usize; 10] = [0, 55, 29, 6, 9, 24, 16, 16, 8, 4];
+
 /// Detail body length of a raw `ItemDetailType` byte (the bytes after the type byte), as read
 /// by the 1.2 client's item detail reader `3961edf0` (the C# `ReadDetails` tables minus one).
 pub fn detail_body_len(detail_type: u8) -> usize {
-    match detail_type {
-        detail_type::EQUIPMENT => 55,
-        detail_type::SLAVE => 29,
-        detail_type::MATE => 6,
-        detail_type::UCC => 9,
-        detail_type::TREASURE | detail_type::LOCATION => 24,
-        detail_type::BIG_FISH | detail_type::DECORATION => 16,
-        detail_type::MUSIC_SHEET => 8,
-        detail_type::GLIDER => 4,
-        detail_type::SLAVE_EQUIPMENT => 12,
-        _ => 0,
-    }
+    DETAIL_BODY_LENS
+        .get(usize::from(detail_type))
+        .copied()
+        .unwrap_or(0)
+}
+
+/// `true` for the types the 1.2 client's detail reader knows (`Invalid` plus cases 1..=9).
+/// Types 10 and 11 must never be written; the client would not consume their body.
+pub fn is_supported_detail_type(detail_type: u8) -> bool {
+    detail_type == detail_type::INVALID
+        || DETAIL_BODY_LENS
+            .get(usize::from(detail_type))
+            .is_some_and(|len| *len > 0)
 }
 
 /// Class-specific detail fields (what each subclass' `ReadDetails` keeps).
@@ -193,9 +201,6 @@ pub struct ItemDetails {
     /// `SummonSlave.RepairStartTime` (unix seconds, 0 = `DateTime.MinValue`). Never restored
     /// from the DB (the C# `ReadDetails` always falls back to `MinValue`).
     pub slave_repair_start_time: UnixTime,
-    /// `ItemDetailType.SlaveEquipment` body (opaque 12 bytes; the 1.2 C# base `Item` keeps it
-    /// as a raw blob).
-    pub slave_equipment: [u8; 12],
     // TreasureMap
     pub map_position_x: i64,
     pub map_position_y: i64,
@@ -285,8 +290,8 @@ impl Item {
             );
             class
         });
-        // Ship parts keep the base `Item` type string in the C# database but always use the
-        // `SlaveEquipment` detail (12 opaque bytes).
+        // Ship parts keep the base `Item` type string in the C# database; the `SlaveEquipment`
+        // class only drives the equipment logic (the 1.2 wire has no detail for it).
         let class = if template
             .is_some_and(|t| t.impl_id == crate::data::items::item_impl::SLAVE_EQUIPMENT)
         {
@@ -488,10 +493,21 @@ impl Item {
         self.dirty = true;
     }
 
+    /// The `DetailType` byte `Item.Write` / the item task write. Every write path goes through
+    /// this guard: a type the 1.2 client cannot read (10, 11, ...) would desync the item.
+    pub fn wire_detail_type(&self) -> u8 {
+        let detail_type = self.class.detail_type();
+        debug_assert!(
+            is_supported_detail_type(detail_type),
+            "item detail type {detail_type} has no 1.2 client reader case"
+        );
+        detail_type
+    }
+
     /// `DetailType` + `WriteDetails` (the 128-byte detail block of item task packets, unpadded).
     pub fn detail_type_and_details(&self) -> Vec<u8> {
         let mut s = PacketStream::new();
-        s.write_u8(self.class.detail_type());
+        s.write_u8(self.wire_detail_type());
         self.write_details(&mut s);
         s.into_bytes()
     }
@@ -569,10 +585,6 @@ impl Item {
                     d.map_position_x = s.read_i64()?;
                     d.map_position_y = s.read_i64()?;
                 }
-                ItemClass::SlaveEquipment => {
-                    let bytes = s.read_bytes(12)?;
-                    d.slave_equipment.copy_from_slice(&bytes);
-                }
                 _ => {}
             }
             Ok(())
@@ -640,10 +652,8 @@ impl Item {
                     .write_i64(d.map_position_x)
                     .write_i64(d.map_position_y);
             }
-            ItemClass::SlaveEquipment => {
-                s.write_raw(&d.slave_equipment);
-            }
-            // Base Item.WriteDetails with DetailType Invalid writes nothing.
+            // Base Item.WriteDetails with DetailType Invalid writes nothing (ship parts,
+            // `ItemClass::SlaveEquipment`, have no 1.2 detail).
             _ => {}
         }
     }
@@ -1059,7 +1069,7 @@ impl Marshal for Item {
             .write_u8(self.grade)
             .write_u8(self.flags)
             .write_i32(self.count)
-            .write_u8(self.class.detail_type());
+            .write_u8(self.wire_detail_type());
         self.write_details(s);
         s.write_i64(self.create_time)
             .write_i32(self.lifespan_mins)
@@ -1142,6 +1152,65 @@ mod tests {
             .write_i64(0)
             .write_i64(600);
         assert_eq!(s.as_bytes(), want.as_bytes());
+    }
+
+    #[test]
+    fn slave_equipment_writes_no_detail_body() {
+        // Sailboat bell (item 29725, `item_impl` 28): the 1.2 client's item detail reader
+        // `3961edf0` has no SlaveEquipment case, so the item goes out as type 0 with no body.
+        let row = ItemRow {
+            type_name: "AAEmu.Game.Models.Game.Items.Item".into(),
+            id: 0x0102030405060708,
+            template_id: 29725,
+            count: 1,
+            details: vec![0xAA; 12],
+            ..ItemRow::default()
+        };
+        let t = ItemTemplate {
+            impl_id: crate::data::items::item_impl::SLAVE_EQUIPMENT,
+            ..ItemTemplate::plain(29725, 1)
+        };
+        let item = Item::from_row(row, Some(&t), 1);
+        assert_eq!(item.class, ItemClass::SlaveEquipment);
+        assert_eq!(item.detail_type_and_details(), vec![detail_type::INVALID]);
+        assert!(item.details_blob().is_empty());
+
+        let mut s = PacketStream::new();
+        item.write(&mut s);
+        let mut want = PacketStream::new();
+        want.write_u32(29725)
+            .write_u64(0x0102030405060708)
+            .write_u8(0)
+            .write_u8(0)
+            .write_i32(1)
+            .write_u8(detail_type::INVALID) // no detail body follows
+            .write_i64(0) // create time
+            .write_i32(0) // lifespan
+            .write_u32(0) // made unit id
+            .write_u8(1) // world id
+            .write_i64(0)
+            .write_i64(0);
+        assert_eq!(s.as_bytes(), want.as_bytes());
+    }
+
+    #[test]
+    fn detail_body_lengths_match_the_1_2_client_reader() {
+        // `FUN_3961edf0`: cases 1..9 read these bodies after the type byte.
+        for (detail, len) in [0usize, 55, 29, 6, 9, 24, 16, 16, 8, 4]
+            .into_iter()
+            .enumerate()
+        {
+            let detail = detail as u8;
+            assert_eq!(detail_body_len(detail), len);
+            assert!(is_supported_detail_type(detail), "type {detail}");
+        }
+        // No case 10 (`SlaveEquipment`) and no case 11 (`Location`): both read no body, so
+        // they are never written as a non-zero body length.
+        for detail in [10u8, 11, 12, 255] {
+            assert_eq!(detail_body_len(detail), 0, "type {detail}");
+            assert!(!is_supported_detail_type(detail), "type {detail}");
+        }
+        assert_eq!(detail_body_len(detail_type::LOCATION), detail_body_len(10));
     }
 
     #[test]

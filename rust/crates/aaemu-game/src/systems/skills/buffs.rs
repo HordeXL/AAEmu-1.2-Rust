@@ -22,7 +22,7 @@ use crate::world::{now_ms, WorldObject};
 use super::data::{BuffTemplate, BuffTriggerTemplate};
 use super::effects::{self, EffectArgs, EffectSource};
 use super::geometry::Target;
-use super::packets::{SCBuffCreatedPacket, SCBuffRemovedPacket};
+use super::packets::{SCBuffCreatedPacket, SCBuffRemovedPacket, SCBuffUpdatedPacket};
 use super::state::SkillRun;
 use super::types::{
     tags, BuffEventTriggerKind, BuffRemoveOn, CastAction, DamageType, SkillCastTarget, SkillCaster,
@@ -806,37 +806,64 @@ pub fn schedule_effect(server: &GameServer, owner: &WorldObject, index: u32, rep
         }
         effect_state::ACTING => {
             let on_action_time = template.on_action_time();
-            let tick_now = set_buff(owner, index, |e| {
+            // The state is read again under the lock: the end of a completed channel
+            // ([`finish_effect_by_skill`]) can take the same ACTING buff at this very moment,
+            // and exactly one of the two may run its Timeout.
+            let step = set_buff(owner, index, |e| {
+                if e.state != effect_state::ACTING {
+                    return TimerStep::Taken;
+                }
                 if e.count == -1 {
                     if on_action_time {
-                        return Some(true);
+                        return TimerStep::Tick;
                     }
                 } else if e.count > 0 {
                     e.count -= 1;
                     if on_action_time && e.count > 0 {
-                        return Some(true);
+                        return TimerStep::Tick;
                     }
                 }
                 e.state = effect_state::FINISHING;
-                None
-            })
-            .flatten();
-            if tick_now.is_some() {
-                let caster = find_obj(server, b.caster_obj_id);
-                time_to_time_apply(server, &template, caster.as_ref(), owner, &b);
-                return;
+                TimerStep::Finish
+            });
+            match step {
+                Some(TimerStep::Tick) => {
+                    let caster = find_obj(server, b.caster_obj_id);
+                    time_to_time_apply(server, &template, caster.as_ref(), owner, &b);
+                    return;
+                }
+                Some(TimerStep::Finish) => {}
+                // The buff is gone, or the other party owns its end.
+                Some(TimerStep::Taken) | None => return,
             }
         }
         _ => {}
     }
-    if get_buff(owner, index).is_some_and(|e| e.state == effect_state::FINISHING) {
-        set_buff(owner, index, |e| {
-            e.state = effect_state::FINISHED;
-            e.in_use = false;
-            e.exit_replace = replace;
-        });
+    // FINISHING -> FINISHED is a claim as well: only the caller that makes the step stops the
+    // effect.
+    let finishing = set_buff(owner, index, |e| {
+        if e.state != effect_state::FINISHING {
+            return false;
+        }
+        e.state = effect_state::FINISHED;
+        e.in_use = false;
+        e.exit_replace = replace;
+        true
+    })
+    .unwrap_or(false);
+    if finishing {
         stop_effect_task(server, owner, index, timed_out);
     }
+}
+
+/// What one `Buff.ScheduleEffect` timer step of an ACTING buff does.
+enum TimerStep {
+    /// A periodic tick (`TimeToTimeApply`).
+    Tick,
+    /// The buff is over: ACTING -> FINISHING was made by this caller.
+    Finish,
+    /// Someone else took the buff meanwhile (the end of a completed channel).
+    Taken,
 }
 
 /// `Buff.StopEffectTask(replace)` (the replace flag travels in `Buff.exit_replace`).
@@ -872,17 +899,41 @@ pub fn exit(server: &GameServer, owner: &WorldObject, index: u32, replace: bool)
 }
 
 /// `Buff.ConsumeCharge(value)`: returns the part of `value` the charge did not absorb.
+///
+/// A non-passive buff that stays updated in place gets `SCBuffUpdatedPacket` (stack 1, the
+/// remaining charge) to the same audience as `SCBuffCreatedPacket` / `SCBuffRemovedPacket`;
+/// passive buffs send no buff packets at all. The C# had no sender, so the timing is inferred;
+/// no retail 1.2 server capture exists (see `PORTING.md`).
 pub fn consume_charge(server: &GameServer, owner: &WorldObject, index: u32, value: i32) -> i32 {
-    let Some((rest, exit_now)) = set_buff(owner, index, |e| {
-        let new_charge = (e.charge - value).max(0);
-        let rest = (value - e.charge).max(0);
+    let Some((rest, exit_now, charge, changed, passive)) = set_buff(owner, index, |e| {
+        let old = e.charge;
+        let new_charge = (old - value).max(0);
+        let rest = (value - old).max(0);
         e.charge = new_charge;
-        (rest, e.charge <= 0)
+        (
+            rest,
+            new_charge <= 0,
+            new_charge,
+            new_charge != old,
+            e.passive,
+        )
     }) else {
         return value;
     };
     if exit_now {
         exit(server, owner, index, false);
+    } else if changed && !passive {
+        broadcast(
+            server,
+            owner,
+            &SCBuffUpdatedPacket {
+                obj_id: owner.obj_id(),
+                index,
+                stack: 1,
+                charge,
+            },
+            true,
+        );
     }
     rest
 }
@@ -1540,7 +1591,13 @@ pub fn remove_effect_by_skill(
 /// completed channel): `Buffs.RemoveEffect(templateId, skillId)` as in the C#, whose
 /// `SetInUse(false)` -> `StopEffectTask` always raised `OnTimeout`. The Rust removal
 /// ([`remove_effect_by_skill`]) deliberately skips the Timeout triggers of explicit removals
-/// (dispels, cancelled channels), so this fires them for each matching effect first.
+/// (dispels, cancelled channels), so a running buff is ended here the way its own timer ends
+/// it: ACTING -> FINISHED, then [`stop_effect_task`] (Timeout, unsubscribe, removal).
+///
+/// The buff's own timer and the end of the channel can come together (the data pairs a channel
+/// with a target buff of the very same length: skill 14054 and buff 1728, 5 s each), and the
+/// Timeout must run once, so taking the buff from ACTING is a claim: the loser leaves the buff
+/// alone (removing it would also take the trigger from the winner, which is still to run it).
 pub fn finish_effect_by_skill(
     server: &GameServer,
     owner: &WorldObject,
@@ -1556,9 +1613,37 @@ pub fn finish_effect_by_skill(
             .collect()
     });
     for index in indices {
-        fire_buff_trigger(server, owner, index, BuffEventTriggerKind::Timeout);
+        let claim = set_buff(owner, index, |e| match e.state {
+            effect_state::ACTING => {
+                e.state = effect_state::FINISHED;
+                e.in_use = false;
+                e.exit_replace = false;
+                Claim::Won
+            }
+            effect_state::CREATED => Claim::NotStarted,
+            _ => Claim::Taken,
+        });
+        match claim {
+            Some(Claim::Won) => stop_effect_task(server, owner, index, true),
+            Some(Claim::NotStarted) => {
+                fire_buff_trigger(server, owner, index, BuffEventTriggerKind::Timeout);
+                owner.with_base_unit(|b| b.buffs_mut().remove_effect_by_index(index));
+                crate::systems::dispatch_buff_events(server, owner);
+            }
+            // Already ending (its timer, or an explicit removal): that path finishes it.
+            Some(Claim::Taken) | None => {}
+        }
     }
-    remove_effect_by_skill(server, owner, template_id, skill_id);
+}
+
+/// Who ends a buff at the end of its channel ([`finish_effect_by_skill`]).
+enum Claim {
+    /// The buff was running: this caller ends it.
+    Won,
+    /// The buff has not started yet (its first schedule step is still to come).
+    NotStarted,
+    /// The buff is already being ended by someone else.
+    Taken,
 }
 
 /// `Buffs.TriggerRemoveOn(on, value)`.
