@@ -29,6 +29,7 @@ use crate::systems::economy::item_effect_packets::{
 };
 use crate::systems::economy::item_packets::SCUnitEquipmentsChangedPacket;
 use crate::systems::npcs::doodad::spawner::SimpleSpawnerDef;
+use crate::systems::npcs::npc::packets::SCUnitModelPostureChangedPacket;
 use crate::systems::npcs::spawn_manager;
 use crate::systems::skills::effects::EffectArgs;
 use crate::systems::skills::packets::SCUnitDeathPacket;
@@ -1321,17 +1322,16 @@ pub fn unbind_slave(server: &GameServer, character: &PlayerRef, tl_id: u32, reas
         );
         return;
     };
-    let point = slave
-        .data()
-        .attached_characters
-        .iter()
-        .find(|(_, c)| *c == character.obj_id)
-        .map_or(attach_point::NONE, |(p, _)| *p);
-    if point != attach_point::NONE {
-        slave
-            .data()
-            .attached_characters
-            .retain(|(p, _)| *p != point);
+    // Find and remove the character's own seat under the slave's one lock: a re-bind between a
+    // check and a separate `retain` could remove the seat the character moved to.
+    let removed = {
+        let mut d = slave.data();
+        d.attached_characters
+            .iter()
+            .position(|(_, c)| *c == character.obj_id)
+            .map(|i| d.attached_characters.remove(i))
+    };
+    if let Some((point, _)) = removed {
         if point == attach_point::DRIVER {
             super::ship_physics::set_driver(server, &slave, false);
         }
@@ -1351,6 +1351,146 @@ pub fn unbind_slave(server: &GameServer, character: &PlayerRef, tl_id: u32, reas
     );
 }
 
+/// Why [`bind_slave`] refused a seat.
+enum BindRefusal {
+    Dead,
+    TooFar,
+    CannonPassenger,
+    SeatTaken,
+    OwnersMark,
+}
+
+/// Surface gap the client's own bind reach checks allow: the 12076 driver bind uses
+/// `FUN_39346290` -> `FUN_39093860(..., 16.0)` (strictly under 4.0 m); the 13863 passenger
+/// interaction uses `FUN_393bf270` -> `FUN_39093860(..., 9.0)` (strictly under 3.0 m), widened
+/// to 12.25 (3.5 m) when the target's `+0x3c26` flag is set. The S11 client work reads that flag
+/// as "riding a mate" (capture-pending S11-C5), keyed on the character's `is_riding`; the
+/// decompile reads `+0x3c26` from the target, so the flag's owner is not proven. This keeps the
+/// S11 reading the passenger-seat task asked for.
+pub fn passenger_reach(character: &PlayerRef) -> f32 {
+    if character.data().is_riding {
+        3.5
+    } else {
+        3.0
+    }
+}
+
+/// `Vector3.Transform(value, Quaternion.Inverse(rotation))`.
+fn inverse_rotate(q: crate::models::transform::Quaternion, v: [f32; 3]) -> [f32; 3] {
+    crate::models::transform::Quaternion {
+        x: -q.x,
+        y: -q.y,
+        z: -q.z,
+        w: q.w,
+    }
+    .rotate(v)
+}
+
+/// Surface gap for a slave bind reach. The client measures its collision geometry
+/// (`FUN_39093860`); the server uses the ship model's mass box when the slave has one and the
+/// requested attach point's world position when the data has it, taking the smaller gap. It only
+/// falls back to the slave origin when neither exists (carts: the origin sits at the seat). A
+/// ship's bare origin is never the measure.
+fn bind_gap(
+    server: &GameServer,
+    world: &WorldInstance,
+    character: &PlayerRef,
+    slave: &SlaveRef,
+    point: u8,
+) -> f32 {
+    let me = WorldObject::from(character);
+    let player = world.world_pos_rot(&me);
+    let player_radius = crate::systems::skills::geometry::model_size(
+        server,
+        &crate::systems::skills::geometry::Target::Obj(me),
+    );
+    let slave_obj = WorldObject::from(slave);
+    let slave_pos = world.world_pos_rot(&slave_obj);
+    let (model_id, scale) = {
+        let d = slave.data();
+        (
+            d.unit.model_id,
+            if d.unit.scale > 0.0 {
+                d.unit.scale
+            } else {
+                1.0
+            },
+        )
+    };
+    let vehicles = &server.game_data.systems.vehicles;
+    let box_distance = vehicles.ship_model(model_id).map(|model| {
+        let center = [
+            model.mass_center_x * scale,
+            model.mass_center_y * scale,
+            model.mass_center_z * scale,
+        ];
+        let half = [
+            model.mass_box_size_x.abs() * scale * 0.5,
+            model.mass_box_size_y.abs() * scale * 0.5,
+            model.mass_box_size_z.abs() * scale * 0.5,
+        ];
+        let local = inverse_rotate(
+            slave_pos.to_quaternion(),
+            [
+                player.x - slave_pos.x,
+                player.y - slave_pos.y,
+                player.z - slave_pos.z,
+            ],
+        );
+        let mut sum = 0.0;
+        for i in 0..3 {
+            let d = local[i] - center[i];
+            let q = d.clamp(-half[i], half[i]);
+            sum += (d - q) * (d - q);
+        }
+        sum.sqrt()
+    });
+    let point_distance = vehicles
+        .attach_points_for_slave(model_id)
+        .and_then(|points| points.iter().find(|(p, _)| *p == point).map(|(_, l)| *l))
+        .map(|location| {
+            let rotated = slave_pos.to_quaternion().rotate([
+                location.x * scale,
+                location.y * scale,
+                location.z * scale,
+            ]);
+            let dx = player.x - (slave_pos.x + rotated[0]);
+            let dy = player.y - (slave_pos.y + rotated[1]);
+            let dz = player.z - (slave_pos.z + rotated[2]);
+            (dx * dx + dy * dy + dz * dz).sqrt()
+        });
+    let distance = match (box_distance, point_distance) {
+        (Some(box_gap), Some(point_gap)) => box_gap.min(point_gap),
+        (Some(gap), None) | (None, Some(gap)) => gap,
+        (None, None) => {
+            let dx = player.x - slave_pos.x;
+            let dy = player.y - slave_pos.y;
+            let dz = player.z - slave_pos.z;
+            (dx * dx + dy * dy + dz * dz).sqrt()
+        }
+    };
+    (distance - player_radius).max(0.0)
+}
+
+/// `SlaveTemplate.SlaveKind` (0 when the template is not loaded).
+pub fn slave_kind(server: &GameServer, slave: &SlaveRef) -> u32 {
+    server
+        .game_data
+        .systems
+        .vehicles
+        .slave_template(slave.data().unit.template_id)
+        .map_or(0, |t| t.slave_kind)
+}
+
+/// A cannon (slave kind 7 siege weapon / 8 slave equipment) has only its gunner seat at point
+/// 1, never a passenger seat.
+pub fn is_cannon_kind(kind: u32) -> bool {
+    matches!(
+        kind,
+        super::data::slave_kind::SIEGE_WEAPON | super::data::slave_kind::SLAVE_EQUIPMENT
+    )
+}
+
 /// `BindSlave(character, objId, attachPoint, bondKind)`.
 pub fn bind_slave(
     server: &GameServer,
@@ -1358,6 +1498,7 @@ pub fn bind_slave(
     obj_id: u32,
     point: u8,
     bond_kind: u8,
+    reach: Option<f32>,
 ) {
     let Some(world) = player_world(server, character) else {
         return;
@@ -1365,22 +1506,91 @@ pub fn bind_slave(
     let Some(slave) = world.slave(obj_id) else {
         return;
     };
-    let (taken, has_mark, summoner) = {
-        let d = slave.data();
-        (
-            d.has_attached_at(point),
-            d.unit.buffs.check_buff(buff::OWNERS_MARK),
-            d.summoner_obj_id,
-        )
-    };
-    if taken {
-        return;
-    }
-    if point == attach_point::DRIVER && has_mark && summoner != character.obj_id {
-        error(character, error::SLAVE_ALREADY_HAS_MASTER);
+    // One slave at a time: the 1.2 client refuses a second slave bind with
+    // `slave_unbind_first` 0x66 (`FUN_39346290`). A mate is not in a slave's
+    // `attached_characters`, so the S11-C5 mate case stays open. `get_is_mounted` walks every
+    // slave, so it runs before this slave's lock.
+    if get_is_mounted(&world, character.obj_id).is_some() {
+        tracing::debug!(
+            "BindSlave: character {} is already on a slave; refusing seat {} of {}",
+            character.obj_id,
+            point,
+            obj_id
+        );
+        error(character, error::SLAVE_UNBIND_FIRST);
         return;
     }
     let me = WorldObject::from(character);
+    // The caller decides the reach: 12076 passes 4.0, 13863 the passenger reach, and the
+    // doodad BoardTransfer path passes `None` because its own doodad func already checked the
+    // range. The gap is snapshotted before the slave lock (the player is a different object
+    // lock); the comparison and the reservation run under that one lock.
+    let gap = reach.map(|_| bind_gap(server, &world, character, &slave, point));
+    let cannon = is_cannon_kind(slave_kind(server, &slave));
+    // Check and reserve the seat under the slave's one lock, so two binds racing for the same
+    // point cannot both pass.
+    let refusal = {
+        let mut d = slave.data();
+        if d.unit.is_dead() {
+            Some(BindRefusal::Dead)
+        } else if reach.zip(gap).is_some_and(|(reach, gap)| gap >= reach) {
+            Some(BindRefusal::TooFar)
+        } else if point != attach_point::DRIVER && cannon {
+            Some(BindRefusal::CannonPassenger)
+        } else if d.has_attached_at(point) {
+            Some(BindRefusal::SeatTaken)
+        } else if point == attach_point::DRIVER
+            && d.unit.buffs.check_buff(buff::OWNERS_MARK)
+            && d.summoner_obj_id != character.obj_id
+        {
+            Some(BindRefusal::OwnersMark)
+        } else {
+            d.attached_characters.push((point, character.obj_id));
+            None
+        }
+    };
+    if let Some(refusal) = refusal {
+        match refusal {
+            BindRefusal::Dead => {
+                tracing::debug!(
+                    "BindSlave: slave {} is dead; ignoring seat {}",
+                    obj_id,
+                    point
+                );
+            }
+            BindRefusal::TooFar => {
+                tracing::debug!(
+                    "BindSlave: character {} is {:.3} m from slave {} (reach {:.3} m)",
+                    character.obj_id,
+                    gap.unwrap_or_default(),
+                    obj_id,
+                    reach.unwrap_or_default()
+                );
+                error(character, error::TOO_FAR_AWAY);
+            }
+            BindRefusal::CannonPassenger => {
+                tracing::debug!(
+                    "BindSlave: slave {} is a cannon and has no passenger seat",
+                    obj_id
+                );
+                error(character, error::SLAVE_CANNOT_BIND);
+            }
+            BindRefusal::SeatTaken => {
+                // The C# returns silently; the client message table has no seat-taken text and
+                // the original server's answer is capture-pending (S11-C2).
+                tracing::debug!(
+                    "BindSlave: seat {} of slave {} is taken; ignoring",
+                    point,
+                    obj_id
+                );
+            }
+            BindRefusal::OwnersMark => {
+                // The C# sends `SlaveAlreadyHasMaster` for this driver-seat refusal only.
+                error(character, error::SLAVE_ALREADY_HAS_MASTER);
+            }
+        }
+        return;
+    }
     broadcast(
         server,
         &me,
@@ -1405,10 +1615,6 @@ pub fn bind_slave(
             true,
         );
     }
-    slave
-        .data()
-        .attached_characters
-        .push((point, character.obj_id));
     if point == attach_point::DRIVER {
         super::ship_physics::set_driver(server, &slave, true);
     }
@@ -1492,16 +1698,142 @@ pub fn may_man_cannon(character: &PlayerRef, cannon: &SlaveRef, world: &WorldIns
     owner || attached || character.data().unit.transform.parent_obj_id == bearer_id
 }
 
-/// A gunner who dies leaves the cannon (a driver or passenger of a ship keeps the C# behaviour).
-pub fn on_gunner_death(server: &GameServer, player: &PlayerRef) {
+/// Server-side turret-aim relay throttle. The 1.2 client's `FUN_39356990` already sends at most
+/// one packet per 200 ms (`DAT_3a169940 + 200 <= now`) and only when its model aim changed;
+/// 150 ms here additionally collapses datagrams that arrive together without hiding the client
+/// rate. The window only delays the relay: the newest aim is always stored and a suppressed
+/// relay is sent by the next 1 s slave tick after the window ends (see
+/// [`flush_pending_turret_state`]).
+pub const TURRET_STATE_MIN_INTERVAL_MS: i64 = 150;
+
+/// Applies a client turret aim (`CSTurretStatePacket`) to the slave named by `unit_id`.
+///
+/// The 1.2 client sends the object id of the unit it controls (`39356990` uses `this+8`), so a
+/// ship cannon names the cannon child slave, a hull with an installed turret names the hull, and
+/// the tank passenger seat names the hull. Any attach point of that slave counts as seated; a
+/// sender who is not on it is ignored. The stored / relayed angles are the raw model-frame
+/// radians of the packet: the client producers already clamp them to the `vehicle_models` turret
+/// limits (or wrap full-circle yaws) before sending (`39425490` / `39425580`). The aim is kept
+/// on the slave and is not cleared on unbind, so late viewers keep the last posture.
+///
+/// The newest aim is always stored (under the slave lock) so a suppressed relay can never
+/// leave late viewers on an older one; the throttle only decides whether it is relayed now or
+/// by the next 1 s slave tick once the window ends.
+pub fn set_turret_state(
+    server: &GameServer,
+    character: &PlayerRef,
+    unit_id: u32,
+    pitch: f32,
+    yaw: f32,
+) {
+    if !pitch.is_finite() || !yaw.is_finite() {
+        return;
+    }
+    let Some(world) = player_world(server, character) else {
+        return;
+    };
+    let Some(slave) = world.slave(unit_id) else {
+        return;
+    };
+    // Check and act under the same lock: only a character seated on this slave may aim it, an
+    // unchanged aim is never relayed, and a changed aim inside the window waits for the tick.
+    let posture = {
+        let mut d = slave.data();
+        if !d
+            .attached_characters
+            .iter()
+            .any(|(_, c)| *c == character.obj_id)
+        {
+            return;
+        }
+        if pitch == d.turret_pitch && yaw == d.turret_yaw {
+            return;
+        }
+        d.turret_pitch = pitch;
+        d.turret_yaw = yaw;
+        let now = now_ms();
+        if now - d.turret_last_update_ms < TURRET_STATE_MIN_INTERVAL_MS {
+            d.turret_relay_pending = true;
+            d.turret_pending_sender_obj_id = character.obj_id;
+            return;
+        }
+        d.turret_relayed_pitch = pitch;
+        d.turret_relayed_yaw = yaw;
+        d.turret_relay_pending = false;
+        d.turret_pending_sender_obj_id = 0;
+        d.turret_last_update_ms = now;
+        SCUnitModelPostureChangedPacket {
+            obj_id: unit_id,
+            posture: crate::models::unit::ModelPostureType::TurretState,
+            has_loot_left: false,
+            anim_action_id: 0,
+            activate_animation: false,
+            turret_pitch: pitch,
+            turret_yaw: yaw,
+        }
+    };
+    let obj = WorldObject::from(&slave);
+    for viewer in world.players_around(&obj) {
+        if viewer.obj_id != character.obj_id {
+            viewer.send(posture);
+        }
+    }
+}
+
+/// Trailing relay of the newest stored turret aim once the [`TURRET_STATE_MIN_INTERVAL_MS`]
+/// window has passed. The 1 s slave tick ([`regen_tick`] via `vehicles::active_region_tick`)
+/// calls this, so an aim suppressed by the window still reaches the players around; an aim
+/// that reverted to the one they already have is not relayed again.
+pub fn flush_pending_turret_state(server: &GameServer, slave: &SlaveRef) {
+    let (posture, sender) = {
+        let mut d = slave.data();
+        if !d.turret_relay_pending
+            || now_ms() - d.turret_last_update_ms < TURRET_STATE_MIN_INTERVAL_MS
+        {
+            return;
+        }
+        d.turret_relay_pending = false;
+        let sender = std::mem::take(&mut d.turret_pending_sender_obj_id);
+        if d.turret_pitch == d.turret_relayed_pitch && d.turret_yaw == d.turret_relayed_yaw {
+            return;
+        }
+        d.turret_relayed_pitch = d.turret_pitch;
+        d.turret_relayed_yaw = d.turret_yaw;
+        d.turret_last_update_ms = now_ms();
+        (
+            SCUnitModelPostureChangedPacket {
+                obj_id: slave.obj_id,
+                posture: crate::models::unit::ModelPostureType::TurretState,
+                has_loot_left: false,
+                anim_action_id: 0,
+                activate_animation: false,
+                turret_pitch: d.turret_pitch,
+                turret_yaw: d.turret_yaw,
+            },
+            sender,
+        )
+    };
+    let obj = WorldObject::from(slave);
+    let Some(world) = world_of(server, &obj) else {
+        return;
+    };
+    for viewer in world.players_around(&obj) {
+        if viewer.obj_id != sender {
+            viewer.send(posture);
+        }
+    }
+}
+
+/// A character who dies leaves any slave seat through the same `unbind_slave` path as logout.
+/// The C# only force-dismounted cannon gunners here, so a ship driver or passenger kept a stale
+/// seat and the one-slave guard then refused every later bind; the Rust unbinds every seat.
+pub fn on_character_death(server: &GameServer, player: &PlayerRef) {
     let Some(world) = player_world(server, player) else {
         return;
     };
-    if let Some((cannon, _)) = get_is_mounted(&world, player.obj_id) {
-        if is_manned_cannon(server, &cannon) {
-            let tl = u32::from(cannon.data().unit.tl_id);
-            unbind_slave(server, player, tl, attach_reason::NONE);
-        }
+    if let Some((slave, _)) = get_is_mounted(&world, player.obj_id) {
+        let tl = u32::from(slave.data().unit.tl_id);
+        unbind_slave(server, player, tl, attach_reason::NONE);
     }
 }
 
@@ -1531,7 +1863,11 @@ fn unbind_riders_of(server: &GameServer, slave: &SlaveRef, reason: u8) {
     }
 }
 
-/// `BindSlave(connection, tlId)` (`CSBindSlavePacket`).
+/// `BindSlave(connection, tlId)` (`CSBindSlavePacket`). The 1.2 packet body is only the target
+/// timeline id (`FUN_393464a0` writes `target+0x41c`; `FUN_39346290` holds the reach / riding
+/// checks) and its only builder is skill 12076 "occupy" (`FUN_393bf310` -> `FUN_39362f50`), so
+/// this path always asks for driver point 1. The passenger seat is skill 13863 -> `AttachTo`
+/// (`special_effects` 2378 value1 2), which reaches [`bind_slave`] directly.
 pub fn bind_slave_by_tl(server: &GameServer, character: &PlayerRef, tl_id: u32) {
     let Some(world) = player_world(server, character) else {
         return;
@@ -1542,19 +1878,9 @@ pub fn bind_slave_by_tl(server: &GameServer, character: &PlayerRef, tl_id: u32) 
     if slave.data().unit.is_dead() {
         return;
     }
-    if is_manned_cannon(server, &slave) {
-        if !may_man_cannon(character, &slave, &world) {
-            error(character, error::SLAVE_CANNOT_BIND);
-            return;
-        }
-        if slave.data().has_attached_at(attach_point::DRIVER) {
-            error(character, error::SLAVE_ALREADY_HAS_MASTER);
-            return;
-        }
-        if get_is_mounted(&world, character.obj_id).is_some() {
-            error(character, error::SLAVE_UNBIND_FIRST);
-            return;
-        }
+    if is_manned_cannon(server, &slave) && !may_man_cannon(character, &slave, &world) {
+        error(character, error::SLAVE_CANNOT_BIND);
+        return;
     }
     bind_slave(
         server,
@@ -1562,6 +1888,7 @@ pub fn bind_slave_by_tl(server: &GameServer, character: &PlayerRef, tl_id: u32) 
         slave.obj_id,
         attach_point::DRIVER,
         attach_reason::NEW_MASTER,
+        Some(4.0),
     );
 }
 
@@ -2415,7 +2742,9 @@ pub(super) fn validated_summon_placement(
         if super::ship_physics::is_water(server, world, [p.x, p.y, p.z]) {
             return invalid("a land vehicle must be summoned on ground");
         }
-        crate::systems::ai::collision::ground_height_or(server, world.id, p.x, p.y, p.z, || p.z)
+        // The 1.2 land rule has no static ground: the spot sits on the terrain heightfield,
+        // and a deck above it is refused later by the line-of-sight ray, not used as the floor.
+        summon_terrain(server, world, p.x, p.y)
     };
     // The spawn height already carries the ship's waterline offset, so the 1.2 check runs on
     // exactly the transform `create_spawn_committed` places.
@@ -3488,22 +3817,8 @@ fn create_spawn_committed(
             spawn_pos.z += offset_z;
         } else {
             // TODO (C#): check for maximum height difference for summoning
-            let h = crate::systems::ai::collision::ground_height_or(
-                server,
-                world.id,
-                spawn_pos.x,
-                spawn_pos.y,
-                spawn_pos.z,
-                || {
-                    crate::systems::npcs::heightmap::world_height(
-                        server,
-                        world,
-                        spawn_pos.x,
-                        spawn_pos.y,
-                    )
-                    .unwrap_or(0.0)
-                },
-            );
+            // The 1.2 land rule's ground is the terrain heightfield only.
+            let h = summon_terrain(server, world, spawn_pos.x, spawn_pos.y);
             if h > 0.0 {
                 spawn_pos.set_height(h);
             }
@@ -3514,23 +3829,9 @@ fn create_spawn_committed(
         spawn_pos.rot_z = final_yaw;
     } else if !template.is_a_boat() {
         // A searched or client-chosen land spot carries its surface height already; re-ground
-        // it here so a static floor (bridge, plaza, quay) wins over the terrain below it.
-        let h = crate::systems::ai::collision::ground_height_or(
-            server,
-            world.id,
-            spawn_pos.x,
-            spawn_pos.y,
-            spawn_pos.z,
-            || {
-                crate::systems::npcs::heightmap::world_height(
-                    server,
-                    world,
-                    spawn_pos.x,
-                    spawn_pos.y,
-                )
-                .unwrap_or(0.0)
-            },
-        );
+        // it here with the same 1.2 rule as the search: the terrain heightfield only, never a
+        // static floor above it (a deck would have blocked the search's line of sight).
+        let h = summon_terrain(server, world, spawn_pos.x, spawn_pos.y);
         if h > 0.0 {
             spawn_pos.set_height(h);
         }
@@ -4436,6 +4737,7 @@ fn mark_summoning_item_as_destroyed(server: &GameServer, slave: &SlaveRef) {
 
 /// `Slave.RegenTick(delta)`.
 pub fn regen_tick(server: &GameServer, slave: &SlaveRef) {
+    flush_pending_turret_state(server, slave);
     let obj = WorldObject::from(slave);
     let (needs, dead, tl, attached) = {
         let d = slave.data();
@@ -5044,12 +5346,14 @@ mod summon_hull_overlap_tests {
     use aaemu_physics::math::{Quat, Vec3};
     use aaemu_physics::world::World;
 
+    use crate::data::client_files::ClientFileManager;
     use crate::data::items::{ItemTemplate, TemplateKind};
     use crate::models::container::slot_type;
     use crate::models::item::Item;
     use crate::systems::ai::collision::models::{ModelPart, ModelPhys};
     use crate::systems::ai::collision::terrain::tests::Plane;
     use crate::systems::ai::collision::world::{CellContent, StaticInstance};
+    use crate::systems::npcs::heightmap::{HeightmapConfig, HeightmapWorlds};
     use crate::systems::skills::data::SkillTemplate;
     use crate::systems::vehicles::data::{slave_kind, SlaveTemplate};
     use crate::test_support::{spawn_player, test_character, TestClient};
@@ -5057,8 +5361,8 @@ mod summon_hull_overlap_tests {
     use super::{
         create_for_owner, get_active_slave_by_owner_obj_id, hull_clear_at, model_box_clear_at,
         overhead_clear_at, summon_candidate_1_2, summon_candidate_points, summon_model_box,
-        summon_offset_z, summon_placement_clear_1_2, validated_summon_placement, HullEnvelope,
-        HullFootprint, ShipModel,
+        summon_offset_z, summon_placement_clear_1_2, summon_terrain, validated_summon_placement,
+        HullEnvelope, HullFootprint, ShipModel,
     };
     use crate::systems::skills::ext::SummonPlacement;
     use aaemu_commons::PacketStream;
@@ -5324,6 +5628,28 @@ mod summon_hull_overlap_tests {
         assert!(clear(&s));
     }
 
+    /// The batched query keeps the client's 1.2 hull box exact in every round: a pier half a
+    /// millimetre outside the envelope is not a contact. (The earlier batching grew its first
+    /// box by a millimetre to defeat the identical-box cache and would report this pier.)
+    #[tokio::test]
+    async fn a_pier_half_a_millimetre_outside_the_hull_is_clear() {
+        let s = world(&[(Vec3::new(507.0005, 500.0, 100.0), Vec3::new(2.0, 2.0, 2.0))]);
+        let found = crate::systems::ai::collision::box_obstacles(
+            &s,
+            0,
+            [500.0, 500.0, 100.5],
+            [5.0, 15.0, 2.5],
+            0.0,
+            crate::systems::ai::collision::query::mask::STATIC_TERRAIN,
+        )
+        .unwrap();
+        assert!(
+            found.is_empty(),
+            "the exact envelope stops short of the pier: {found:?}"
+        );
+        assert!(clear(&s));
+    }
+
     /// Vegetation is decorative for hull placement, whatever its size.
     #[tokio::test]
     async fn vegetation_inside_the_envelope_is_ignored() {
@@ -5352,6 +5678,57 @@ mod summon_hull_overlap_tests {
             "the vegetation entity intersects the envelope box"
         );
         assert!(clear(&s));
+    }
+
+    /// The physics contact pool holds 64 records and drops further parts silently
+    /// (`prim_intersect.rs` gate; `pwi.rs:402-404`). Vegetation is filtered only after the
+    /// query, so a wall of 64 vegetation parts can fill the pool and hide a pier that is tested
+    /// later. `box_obstacles` batches with a skip list of the entities already seen, so the
+    /// pier behind the vegetation is still found and the spot is refused.
+    #[tokio::test]
+    async fn a_pier_behind_vegetation_filling_the_contact_pool_is_found() {
+        let mut statics = vec![(
+            Vec3::new(503.0, 507.0, 100.0),
+            Vec3::new(2.5, 2.5, 2.5),
+            false,
+        )];
+        for i in 0..64 {
+            statics.push((
+                Vec3::new(
+                    496.0 + (i % 8) as f32 * 1.1,
+                    491.0 + (i / 8) as f32 * 2.5,
+                    103.0,
+                ),
+                Vec3::splat(0.4),
+                true,
+            ));
+        }
+        let s = world_at(GROUND, &statics);
+        assert!(
+            !clear(&s),
+            "the pier overlaps the hull envelope behind the vegetation"
+        );
+    }
+
+    /// Dense vegetation alone fills the contact pool too; the batched query collects the
+    /// remaining parts and, with every owner vegetation, the spot stays accepted (batching, not
+    /// the fail-safe refusal).
+    #[tokio::test]
+    async fn dense_vegetation_filling_the_contact_pool_is_still_accepted() {
+        let mut statics = Vec::new();
+        for i in 0..80 {
+            statics.push((
+                Vec3::new(
+                    496.0 + (i % 8) as f32 * 1.1,
+                    487.0 + (i / 8) as f32 * 2.5,
+                    103.0,
+                ),
+                Vec3::splat(0.4),
+                true,
+            ));
+        }
+        let s = world_at(GROUND, &statics);
+        assert!(clear(&s), "vegetation is never a hull obstacle");
     }
 
     /// Yaw 90: the off-centre footprint must put the box mid 5 m along -X with the length
@@ -5566,6 +5943,13 @@ mod summon_hull_overlap_tests {
         let world = near.world.world(0).unwrap();
         let t = summon_candidate_1_2(&near, &world, &p, &template).expect("candidate");
         assert!((t.z - 201.0).abs() < 1e-4, "{t:?}");
+        // z = 100 + 2.1·y: 1150 at the player, 1160.5 at the first candidate (10.5 m, over the
+        // 1.2 `terrain - player_z <= 10` boundary).
+        let above = slope_server(100.0, 2.1, &[]);
+        let (_client, p) = search_player(&above);
+        p.data().unit.transform.set_height(1150.0);
+        let world = above.world.world(0).unwrap();
+        assert!(summon_candidate_1_2(&above, &world, &p, &template).is_none());
         // z = 100 + 2.5·y: 1350 at the player, 1362.5 at the first candidate (12.5 m).
         let far = slope_server(100.0, 2.5, &[]);
         let (_client, p) = search_player(&far);
@@ -5574,8 +5958,8 @@ mod summon_hull_overlap_tests {
         assert!(summon_candidate_1_2(&far, &world, &p, &template).is_none());
     }
 
-    /// 6 m up over 30 m: the candidate's ground is above the player's feet, so the ray must end
-    /// above the candidate's own ground (the 1.2 eye-to-eye rule), not at the player's feet.
+    /// 6 m up over 30 m: the candidate's terrain point is above the player's feet, so the ray
+    /// must end above the candidate's own terrain (the 1.2 rule), not at the player's feet.
     #[tokio::test]
     async fn an_uphill_land_summon_is_accepted() {
         let s = slope_server(100.0, 0.2, &[]);
@@ -5587,7 +5971,7 @@ mod summon_hull_overlap_tests {
         assert!((t.z - 206.0).abs() < 1e-4, "{t:?}");
     }
 
-    /// A client `SummonPos` uphill is validated with the same eye-to-eye ray.
+    /// A client `SummonPos` uphill is validated with the same terrain-point ray.
     #[tokio::test]
     async fn an_uphill_client_placement_is_validated() {
         let s = slope_server(100.0, 0.2, &[]);
@@ -5612,6 +5996,51 @@ mod summon_hull_overlap_tests {
         ));
     }
 
+    /// Without the collision service the client placement's land surface is the same terrain
+    /// helper as every other land path (`summon_terrain`: heightmap, else 0), not the client's
+    /// `z`: the 1.2 rule has no static ground to fall back to.
+    #[tokio::test]
+    async fn a_client_placement_without_collision_uses_the_terrain_fallback() {
+        let s = crate::test_support::test_server_with(land_data());
+        s.config.update(|c| c.physics.enable = false);
+        let files = Arc::new(ClientFileManager::from_sources(
+            &[],
+            std::path::Path::new("."),
+        ));
+        s.systems
+            .npcs
+            .heightmaps
+            .install(Arc::new(HeightmapWorlds::new(
+                files,
+                &s.game_data.worlds,
+                HeightmapConfig {
+                    heightmaps_enable: true,
+                    ..Default::default()
+                },
+            )));
+        let (_client, p) = search_player(&s);
+        // x = -2 makes the heightmap read fail (`x % 1024 / 2 < 0`), so the terrain helper
+        // falls back to 0; the old placement fallback kept the client's z (200).
+        p.data()
+            .unit
+            .transform
+            .set_position(-2.0, 500.0, 200.0, 0.0, 0.0, 0.0);
+        let world = s.world.world(0).unwrap();
+        let placement = SummonPlacement {
+            x: -2.0,
+            y: 530.0,
+            z: 200.0,
+            yaw: 0.0,
+        };
+        let t = validated_summon_placement(&s, &world, &p, &land_template(), Some(placement), 0.0)
+            .expect("placement");
+        assert!(
+            (t.z - summon_terrain(&s, &world, t.x, t.y)).abs() < 1e-4,
+            "the fallback must be the terrain helper: {t:?}"
+        );
+        assert!((t.z - 0.0).abs() < 1e-4, "no heightmap data: {t:?}");
+    }
+
     /// A wall between the player and the spot still refuses the summon.
     #[tokio::test]
     async fn a_wall_between_the_player_and_a_land_spot_refuses() {
@@ -5626,11 +6055,14 @@ mod summon_hull_overlap_tests {
         assert!(summon_candidate_1_2(&s, &world, &p, &land_template()).is_none());
     }
 
-    /// A cart summoned on a bridge/plaza/quay must spawn on the static floor, not on the terrain
-    /// under it: the search and the final spawn use the same static-aware ground.
+    /// The 1.2 land rule takes the candidate height from the terrain only
+    /// (`I3DEngine::GetTerrainElevation`, `FUN_39347fb0`). A deck between the player's eyes and
+    /// the candidate's terrain point is therefore hit by the line-of-sight ray (statics + terrain,
+    /// mask 0x107) and the summon is refused with error 100, instead of the deck becoming the
+    /// spawn floor.
     #[tokio::test]
-    async fn a_land_summon_spawns_on_a_static_floor_above_the_terrain() {
-        // A 1 m slab with its top 5 m above the terrain, under the player and the candidate.
+    async fn a_deck_above_the_candidate_terrain_refuses_a_land_summon() {
+        // A 1 m slab with its top 5 m above the terrain, under the player and every candidate.
         let s = world_on(
             land_data(),
             Plane {
@@ -5646,24 +6078,117 @@ mod summon_hull_overlap_tests {
             )],
         );
         install_empty_hull_loader(&s);
-        let (_client, p) = search_player(&s);
+        let (mut client, p) = search_player(&s);
+        client.conn.active_char = Some(p.clone());
         p.data().unit.transform.set_height(105.0);
         give_summon_item(&s, &p, 0x9110);
-        let slave = tokio::time::timeout(
+        let result = tokio::time::timeout(
             Duration::from_secs(2),
             create_for_owner(&s, &p, 0x9110, RULE_ITEM, false, None, None, 0.0),
         )
         .await
-        .expect("summon job")
-        .expect("the cart spawns on the floor");
-        let t = slave.data().unit.transform;
+        .expect("summon job");
+        assert!(result.is_none(), "the deck blocks every candidate's ray");
         assert!(
-            (t.x - 500.0).abs() < 1e-4 && (t.y - 530.0).abs() < 1e-4,
-            "{t:?}"
+            s.items.item_by_id(0x9110).is_some(),
+            "a refused summon keeps the item"
+        );
+        let codes: Vec<i16> = client
+            .drain()
+            .iter()
+            .filter(|f| f.0 == crate::opcodes::sc::SCErrorMsgPacket)
+            .map(|f| i16::from_le_bytes([f.1[0], f.1[1]]))
+            .collect();
+        assert!(codes.contains(&100), "{codes:?}");
+    }
+
+    /// The same deck above the terrain refuses a client-supplied `SummonPos`: the 1.2
+    /// placement check's line-of-sight ray hits it (error 100) and the item is not used.
+    #[tokio::test]
+    async fn a_deck_above_the_candidate_terrain_refuses_a_client_placement() {
+        let s = world_on(
+            land_data(),
+            Plane {
+                a: 110.0,
+                b: 0.0,
+                c: 0.0,
+                n: 1024,
+            },
+            &[(
+                Vec3::new(500.0, 515.0, 114.5),
+                Vec3::new(10.0, 25.0, 0.5),
+                false,
+            )],
+        );
+        install_empty_hull_loader(&s);
+        let (mut client, p) = search_player(&s);
+        client.conn.active_char = Some(p.clone());
+        p.data().unit.transform.set_height(115.0);
+        give_summon_item(&s, &p, 0x9210);
+        let placement = SummonPlacement {
+            x: 500.0,
+            y: 530.0,
+            z: 110.0,
+            yaw: 0.0,
+        };
+        let result = tokio::time::timeout(
+            Duration::from_secs(2),
+            create_for_owner(&s, &p, 0x9210, RULE_ITEM, false, None, Some(placement), 0.0),
+        )
+        .await
+        .expect("summon job");
+        assert!(
+            result.is_none(),
+            "the deck blocks the client placement's ray"
         );
         assert!(
-            (t.z - 105.0).abs() < 1e-4,
-            "the floor, not the terrain below: {t:?}"
+            s.items.item_by_id(0x9210).is_some(),
+            "a refused summon keeps the item"
+        );
+        let codes: Vec<i16> = client
+            .drain()
+            .iter()
+            .filter(|f| f.0 == crate::opcodes::sc::SCErrorMsgPacket)
+            .map(|f| i16::from_le_bytes([f.1[0], f.1[1]]))
+            .collect();
+        assert!(codes.contains(&100), "{codes:?}");
+    }
+
+    /// A positioned land spawn re-grounds to the terrain, not to a low static floor: the 1.2
+    /// land rule never uses statics as the ground (the search, placement and recheck paths do
+    /// the same).
+    #[tokio::test]
+    async fn a_land_spawn_under_a_low_deck_regrounds_to_the_terrain() {
+        let s = world_on(
+            land_data(),
+            Plane {
+                a: 100.0,
+                b: 0.0,
+                c: 0.0,
+                n: 1024,
+            },
+            &[(
+                Vec3::new(500.0, 530.0, 100.75),
+                Vec3::new(10.0, 10.0, 0.25),
+                false,
+            )],
+        );
+        install_empty_hull_loader(&s);
+        let (_client, p) = search_player(&s);
+        give_summon_item(&s, &p, 0x9111);
+        let mut at = crate::models::transform::Transform::default();
+        at.set_position(500.0, 530.0, 100.0, 0.0, 0.0, 0.0);
+        let slave = tokio::time::timeout(
+            Duration::from_secs(2),
+            create_for_owner(&s, &p, 0x9111, RULE_ITEM, false, Some(at), None, 0.0),
+        )
+        .await
+        .expect("summon job")
+        .expect("the cart spawns");
+        let t = slave.data().unit.transform;
+        assert!(
+            (t.z - 100.0).abs() < 1e-4,
+            "the terrain, not the low deck top: {t:?}"
         );
     }
 
@@ -6149,6 +6674,66 @@ mod summon_hull_overlap_tests {
         })));
     }
 
+    /// Adds a deck above the player and the chosen spot once the item wait is over: the spot
+    /// the search accepted becomes covered while the summon job waits.
+    fn cover_spot_after_item_validation(s: &crate::GameServer) {
+        *s.systems
+            .vehicles
+            .slave_summons
+            .test_after_item_validation
+            .lock()
+            .unwrap() = Some(super::TestPublicationHook(Arc::new(|server| {
+            let pw = crate::systems::ai::collision::phys_world(server, 0).expect("physics world");
+            let mut st = pw.lock();
+            assert!(st
+                .add_static_instance(
+                    &static_box(
+                        Vec3::new(10.0, 25.0, 0.5),
+                        Vec3::new(500.0, 515.0, 114.5),
+                        false,
+                    ),
+                    crate::systems::ai::collision::world::Owner::Brush { cell: (0, 0) },
+                )
+                .is_some());
+        })));
+    }
+
+    /// A deck that appears above the player's chosen spot during the waits is caught by the
+    /// post-wait recheck: the recheck's line-of-sight ray hits it, the rerun search finds no
+    /// candidate either, and the summon refuses with error 100 without using the item.
+    #[tokio::test]
+    async fn a_deck_appearing_after_the_search_refuses_the_post_wait_recheck() {
+        let s = world_at_with(land_data(), 110.0, &[]);
+        install_empty_hull_loader(&s);
+        let (mut client, p) = search_player(&s);
+        client.conn.active_char = Some(p.clone());
+        p.data().unit.transform.set_height(115.0);
+        give_summon_item(&s, &p, 0x9211);
+        p.data().unit.cooldowns.add_cooldown(RULE_SKILL, 10_000, 0);
+        p.data().unit.global_cooldown_ms = 10_000;
+        cover_spot_after_item_validation(&s);
+        let result = tokio::time::timeout(
+            Duration::from_secs(2),
+            create_for_owner(&s, &p, 0x9211, RULE_ITEM, false, None, None, 0.0),
+        )
+        .await
+        .expect("summon job");
+        assert!(
+            result.is_none(),
+            "the deck blocks the recheck and the rerun search"
+        );
+        assert!(s.items.item_by_id(0x9211).is_some(), "the item is not used");
+        let codes: Vec<i16> = client
+            .drain()
+            .iter()
+            .filter(|f| f.0 == crate::opcodes::sc::SCErrorMsgPacket)
+            .map(|f| i16::from_le_bytes([f.1[0], f.1[1]]))
+            .collect();
+        assert!(codes.contains(&100), "{codes:?}");
+        assert!(!p.data().unit.cooldowns.cooldowns.contains_key(&RULE_SKILL));
+        assert_eq!(p.data().unit.global_cooldown_ms, 0);
+    }
+
     /// A spot chosen before the waits is rechecked at the player's current pose; when it no
     /// longer passes, the search reruns from there instead of spawning the stale spot.
     #[tokio::test]
@@ -6355,21 +6940,20 @@ pub(crate) fn summon_candidate_points(
     out
 }
 
-/// The collision terrain height at (x, y), the heightmap when the service has no terrain.
+/// The land summon candidate height: `I3DEngine::GetTerrainElevation(x, y, 0)` (vtable
+/// `+0x1fc`), i.e. the terrain heightfield only, never static geometry (`FUN_39347fb0`). The
+/// heightmap is the fallback when the collision service has no terrain. A deck, bridge or quay
+/// above the terrain is not a landing spot for the 1.2 rule; it blocks the line of sight instead.
 fn summon_terrain(server: &GameServer, world: &WorldInstance, x: f32, y: f32) -> f32 {
     crate::systems::ai::collision::terrain_height_or(server, world.id, x, y, || {
         crate::systems::npcs::heightmap::world_height(server, world, x, y).unwrap_or(0.0)
     })
 }
 
-/// The ground under a land summon candidate at (x, y), probed down from `z`: statics such as
-/// bridges, plazas and quays first, the heightmap when nothing is hit. Searching from the
-/// player's feet keeps a found floor on the spawn surface instead of the terrain below it.
-fn summon_ground(server: &GameServer, world: &WorldInstance, x: f32, y: f32, z: f32) -> f32 {
-    crate::systems::ai::collision::ground_height_or(server, world.id, x, y, z, || {
-        crate::systems::npcs::heightmap::world_height(server, world, x, y).unwrap_or(0.0)
-    })
-}
+/// How far above the candidate's terrain point a land summon line-of-sight ray ends. 1.2 ends
+/// the ray exactly at the point; the 0.2 m lift is a deviation that avoids a float graze
+/// between the ray end and the heightfield (the Bevy client port lifts its end the same way).
+const SUMMON_LOS_END_LIFT: f32 = 0.2;
 
 /// The 1.2 line-of-sight rule: a ray from the player's eyes to the candidate hits nothing
 /// (static + terrain, rays 0x8F). No collision service counts as clear.
@@ -6492,8 +7076,8 @@ fn model_box_clear_at(
 
 /// The 1.2 client summon search (`FUN_39347fb0`): the first candidate that passes all four
 /// checks wins. The candidate z is the water surface for ships (terrain must not be above it)
-/// and the ground for land slaves (statics such as bridges, plazas and quays first, then the
-/// heightmap; the terrain is at most 10 m above the player). The model box is the unclipped
+/// and the terrain for land slaves (`GetTerrainElevation`, vtable `+0x1fc`; the terrain is at
+/// most 10 m above the player). The model box is the unclipped
 /// model bbox rotated by the player yaw plus 90 degrees; the distance cap is 80 m. Returns the
 /// final spawn transform, or `None` when none of the 120 candidates passes. Debug logs the
 /// per-check rejection counts; the separate `Physics:SummonDiagnostics` option keeps scanning
@@ -6534,7 +7118,7 @@ pub(crate) fn summon_candidate_1_2(
         } else {
             None
         };
-        let z = water.unwrap_or_else(|| summon_ground(server, world, x, y, me.z));
+        let z = water.unwrap_or(terrain);
         let terrain_ok = water.map_or(terrain - me.z <= 10.0, |water| terrain <= water);
         if !terrain_ok {
             terrain_rej += 1;
@@ -6544,10 +7128,14 @@ pub(crate) fn summon_candidate_1_2(
         if !distance_ok {
             distance_rej += 1;
         }
-        // Ships are seen against the water surface. Land candidates use an eye-to-eye ray like
-        // the 1.2 rule (from z + 1): ending at the player's foot height would put the endpoint
-        // under an uphill candidate's ground and refuse it.
-        let los_to = if is_boat { [x, y, z] } else { [x, y, z + 1.0] };
+        // Ships are seen against the water surface. Land rays end at the candidate's terrain
+        // point (lifted by [`SUMMON_LOS_END_LIFT`]): a deck between the eyes and the terrain is
+        // hit and refuses the spot, and an uphill terrain point is not under the player's feet.
+        let los_to = if is_boat {
+            [x, y, z]
+        } else {
+            [x, y, z + SUMMON_LOS_END_LIFT]
+        };
         let los_ok = summon_los_clear(server, world.id, [me.x, me.y, me.z + 1.0], los_to);
         if !los_ok {
             los_rej += 1;
@@ -6615,11 +7203,13 @@ pub(super) fn summon_placement_clear_1_2(
         0.0
     };
     let water = transform.z - offset_z;
-    let (dx, dy, dz) = (transform.x - me.x, transform.y - me.y, water - me.z);
+    let terrain = summon_terrain(server, world, transform.x, transform.y);
+    // Land uses the terrain-only surface on every path; ships keep the water surface.
+    let surface = if is_boat { water } else { terrain };
+    let (dx, dy, dz) = (transform.x - me.x, transform.y - me.y, surface - me.z);
     if dx * dx + dy * dy + dz * dz > 80.0 * 80.0 {
         return false;
     }
-    let terrain = summon_terrain(server, world, transform.x, transform.y);
     if is_boat {
         if terrain > water {
             return false;
@@ -6627,12 +7217,12 @@ pub(super) fn summon_placement_clear_1_2(
     } else if terrain - me.z > 10.0 {
         return false;
     }
-    // Land uses an eye-to-eye ray: `water` is the candidate's own (static-aware) ground, so the
-    // endpoint is above the floor it will spawn on, not at the player's foot height.
+    // Land rays end just above the candidate's terrain point ([`SUMMON_LOS_END_LIFT`]); a deck
+    // between the eyes and that point is hit, so a bridge or quay above the terrain refuses.
     let los_to = if is_boat {
-        [transform.x, transform.y, water]
+        [transform.x, transform.y, surface]
     } else {
-        [transform.x, transform.y, water + 1.0]
+        [transform.x, transform.y, surface + SUMMON_LOS_END_LIFT]
     };
     if !summon_los_clear(server, world.id, [me.x, me.y, me.z + 1.0], los_to) {
         return false;
@@ -6643,7 +7233,7 @@ pub(super) fn summon_placement_clear_1_2(
             world.id,
             transform.x,
             transform.y,
-            water,
+            surface,
             transform.rot_z,
             &bounds,
             offset_z,
@@ -6674,7 +7264,7 @@ fn revalidated_searched_placement(
     let surface = if is_boat {
         super::ship_physics::water_surface(server, world, [transform.x, transform.y, me.z])
     } else {
-        summon_ground(server, world, transform.x, transform.y, transform.z)
+        summon_terrain(server, world, transform.x, transform.y)
     };
     let mut check = transform;
     check.set_position(
