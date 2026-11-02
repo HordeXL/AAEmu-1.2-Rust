@@ -1,7 +1,8 @@
 //! Quest packets: `CSStartQuestContextPacket`, `CSCompleteQuestContextPacket`,
 //! `CSDropQuestContextPacket`, `CSQuestTalkMadePacket`, `CSQuestStartWithPacket`,
 //! `CSTryQuestCompleteAsLetItDonePacket`, `CSRestartMainQuestPacket`, `CSSaveTutorialPacket`,
-//! `CSStartedCinemaPacket`, `CSCompletedCinemaPacket` and the quest S->C packets.
+//! `CSRequestPermissionToPlayCinemaForDirectingMode`, `CSStartedCinemaPacket`,
+//! `CSCompletedCinemaPacket` and the quest S->C packets.
 
 use aaemu_commons::{Marshal, PacketStream};
 use futures::future::BoxFuture;
@@ -108,6 +109,42 @@ impl Marshal for SCQuestContextResetPacket {
         s.write_u32(self.quest_id)
             .write_raw(&self.body)
             .write_u32(self.component_id);
+    }
+}
+
+/// Reason bytes of `SCQuestContextFailedPacket` (`0x146`).
+///
+/// The client raises `QUEST_ERROR_INFO` with the byte and shows
+/// `locale.questContext.errors[err]`. `x2ui/baselib/locale_helper.alb` builds that table as a
+/// 1-based Lua list (`SETLIST` at instruction 654; value 1 is `already_have`, 2
+/// `invalid_quest`, ...), and `quest_context.alb` proto 22 (the `QUEST_ERROR_INFO` handler)
+/// indexes it directly with its first argument. The client's own pre-checks use the same
+/// codes: `FUN_3937a2d0` sends 2 when the quest is invalid and 0x14 after its can-interact
+/// check fails.
+pub mod quest_error {
+    pub const INVALID_QUEST: u8 = 2;
+    pub const INVALID_NPC_OR_QUEST: u8 = 7;
+    pub const INVALID_QUEST_STATUS: u8 = 12;
+    pub const INVALID_DOODAD: u8 = 19;
+}
+
+/// `SCQuestContextFailedPacket(questId, err)` (`0x146`). The client's reader
+/// `FUN_397b5c90` (vtable `399b3a5c`) reads the field `"type"` as a u32 at `+0xc` and
+/// `"err"` as one byte at `+0x10`; `OnQuestContextFailed` (`FUN_391dbcd0`) forwards both
+/// to `FUN_3937a130`, which raises `QUEST_ERROR_INFO` and ends quest directing mode.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct SCQuestContextFailedPacket {
+    pub quest_id: u32,
+    pub err: u8,
+}
+packet_def!(
+    SCQuestContextFailedPacket,
+    level = LEVEL_PLAIN,
+    opcode = sc::SCQuestContextFailedPacket
+);
+impl Marshal for SCQuestContextFailedPacket {
+    fn write(&self, s: &mut PacketStream) {
+        s.write_u32(self.quest_id).write_u8(self.err);
     }
 }
 
@@ -446,6 +483,10 @@ impl ClientPacket for CSTryQuestCompleteAsLetItDonePacket {
                     target,
                     self.obj_id
                 );
+                p.send(SCQuestContextFailedPacket {
+                    quest_id: self.id,
+                    err: quest_error::INVALID_NPC_OR_QUEST,
+                });
                 return Ok(());
             }
             let (id, selected) = (self.id, self.selected);
@@ -552,6 +593,55 @@ impl ClientPacket for CSSaveTutorialPacket {
     }
 }
 
+/// `CSRequestPermissionToPlayCinemaForDirectingMode`: the 1.2 client sends it before it plays
+/// the cinema of a quest component it just accepted / turned in / talked about, and never waits
+/// for an answer. The `u32` is the quest **component** id (not the quest context id).
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct CSRequestPermissionToPlayCinemaForDirectingMode {
+    pub component_id: u32,
+    pub npc_obj_id: u32,
+    pub doodad_obj_id: u32,
+}
+
+impl ClientPacket for CSRequestPermissionToPlayCinemaForDirectingMode {
+    const NAME: &'static str = "CSRequestPermissionToPlayCinemaForDirectingMode";
+
+    fn read(s: &mut PacketStream) -> Result<Self> {
+        Ok(Self {
+            component_id: s.read_u32()?,
+            npc_obj_id: s.read_bc()?,
+            doodad_obj_id: s.read_bc()?,
+        })
+    }
+
+    fn handle<'a>(
+        self,
+        server: &'a GameServer,
+        conn: &'a mut GameConnection,
+    ) -> BoxFuture<'a, Result<()>> {
+        Box::pin(async move {
+            let Some(p) = active(conn) else {
+                return Ok(());
+            };
+            let data = &server.game_data.systems.quests;
+            let quest_id = data.component(self.component_id).map_or(0, |c| c.quest_id);
+            let cinema_id = data.component_cinema_id(self.component_id);
+            tracing::info!(
+                "RequestPermissionToPlayCinema, {} ({}), Quest {}, Component {}, Cinema {}, NpcObjId {}, DoodadObjId {}",
+                p.data().unit.name,
+                p.character_id,
+                quest_id,
+                self.component_id,
+                cinema_id.map_or("none".to_string(), |id| data.cinema_label(id)),
+                self.npc_obj_id,
+                self.doodad_obj_id
+            );
+            events::request_cinema(server, &p, cinema_id.unwrap_or(0));
+            Ok(())
+        })
+    }
+}
+
 /// `CSStartedCinemaPacket` (empty).
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct CSStartedCinemaPacket;
@@ -569,7 +659,6 @@ impl ClientPacket for CSStartedCinemaPacket {
         conn: &'a mut GameConnection,
     ) -> BoxFuture<'a, Result<()>> {
         Box::pin(async move {
-            tracing::warn!("StartedCinema");
             if let Some(p) = active(conn) {
                 events::on_cinema_started(server, &p);
             }
@@ -578,7 +667,8 @@ impl ClientPacket for CSStartedCinemaPacket {
     }
 }
 
-/// `CSCompletedCinemaPacket` (empty): restore neighbouring objects before quest events.
+/// `CSCompletedCinemaPacket` (empty): restores the neighbouring objects a cut scene removed
+/// from the client, then raises the quest events.
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct CSCompletedCinemaPacket;
 
@@ -595,11 +685,33 @@ impl ClientPacket for CSCompletedCinemaPacket {
         conn: &'a mut GameConnection,
     ) -> BoxFuture<'a, Result<()>> {
         Box::pin(async move {
-            tracing::warn!("CompletedCinema");
-            if let Some(p) = active(conn) {
+            let Some(p) = active(conn) else {
+                return Ok(());
+            };
+            let data = &server.game_data.systems.quests;
+            let end = events::cinema_ending(&p);
+            let cinema = data.cinema(end.cinema_id);
+            // Only a CUT_SCENE sequence wipes the client's units and doodads. A cinema that is
+            // unknown (no request seen, no client file) is treated as one: an empty world after
+            // a cut scene is worse than a redundant re-send.
+            let resend = cinema.and_then(|c| c.cut_scene) != Some(false);
+            tracing::info!(
+                "CompletedCinema, {} ({}), Cinema {}, played {}, objects re-sent: {}",
+                p.data().unit.name,
+                p.character_id,
+                data.cinema_label(end.cinema_id),
+                end.played_ms
+                    .map_or("? ms".to_string(), |ms| format!("{ms} ms")),
+                resend
+            );
+            if resend {
+                // The cut-scene wipe also clears the client's own-mate records; the mates
+                // re-created below need theirs first (a rider attached to a mate without a
+                // record crashes the client).
+                crate::systems::vehicles::mates::resend_owner_mates_spawned(server, &p);
                 crate::systems::npcs::portal::resend_visible_objects_to_character(server, &p);
-                events::on_cinema_ended(server, &p);
             }
+            events::on_cinema_ended(server, &p);
             Ok(())
         })
     }

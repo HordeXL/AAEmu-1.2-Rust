@@ -11,11 +11,13 @@ use super::model::{
     FACTION_MONSTROSITY,
 };
 use super::packets::{
-    SCQuestContextCompletedPacket, SCQuestContextResetPacket, SCQuestContextStartedPacket,
-    SCQuestContextUpdatedPacket, SCQuestRewardedByMailPacket,
+    quest_error, SCQuestContextCompletedPacket, SCQuestContextFailedPacket,
+    SCQuestContextResetPacket, SCQuestContextStartedPacket, SCQuestContextUpdatedPacket,
+    SCQuestRewardedByMailPacket,
 };
 use super::state::{
-    ActPath, Quest, QuestActState, QuestComponentState, QuestHandle, QuestState, QuestStepState,
+    ActPath, CinemaMark, Quest, QuestActState, QuestComponentState, QuestHandle, QuestState,
+    QuestStepState,
 };
 use super::templates::ActKind;
 use super::unit_reqs::{ReqEnv, ReqSubject};
@@ -139,6 +141,30 @@ pub struct Ctx<'a> {
     pub buffs_changed: bool,
     /// Packets sent through [`Ctx::send`] when there is no player (tests).
     pub sent: Vec<(u16, Vec<u8>)>,
+    /// What the report acts saw while a `ReportNpc` / `ReportDoodad` event was dispatched.
+    pub report_reply: Option<ReportReply>,
+    /// Quest ids already answered with [`SCQuestContextFailedPacket`] in this operation.
+    pub report_refused: Vec<u32>,
+    /// Whether a refused report is answered with [`SCQuestContextFailedPacket`]: only a
+    /// report the client asked for (`CSCompleteQuestContext`) puts it in quest directing
+    /// mode. A server-side report (`DoodadFuncQuest`, a doodad click on an owned quest) is
+    /// only logged, so a click before the objectives are met shows no quest error.
+    pub answer_reports: bool,
+}
+
+/// The result of one report event, collected across the quest's report acts: a component may
+/// hold several report NPCs / doodads (OR acts), so a mismatch in one act does not refuse the
+/// report when another act accepts it.
+#[derive(Debug, Clone, Default, PartialEq, Eq)]
+pub struct ReportReply {
+    /// A report act matched the NPC / doodad of the event.
+    pub target_matched: bool,
+    /// The matching act advanced the quest.
+    pub accepted: bool,
+    /// Refusal of the matching act (it matched but could not run).
+    pub matched_refusal: Option<u8>,
+    /// Refusal of a non-matching act (wrong NPC / doodad).
+    pub mismatch_refusal: Option<u8>,
 }
 
 /// Quest ids from here on have a completed block id above `u16::MAX` (`SCCompletedQuests`).
@@ -210,6 +236,44 @@ impl<'a> Ctx<'a> {
             );
             self.st.refusal_log.insert(key, self.now_ms);
         }
+    }
+
+    /// Answers a refused quest report with `SCQuestContextFailedPacket` (0x146), at most
+    /// once per quest for this operation. Independent of [`Ctx::log_refusal`]'s repeat
+    /// suppression: even a refusal that is only logged at DEBUG is answered.
+    pub fn send_report_refused(&mut self, quest_id: u32, err: u8) {
+        if !self.answer_reports || self.report_refused.contains(&quest_id) {
+            return;
+        }
+        self.report_refused.push(quest_id);
+        self.send(SCQuestContextFailedPacket { quest_id, err });
+    }
+
+    /// The reply of the report event being dispatched, created on first use.
+    pub fn report_reply(&mut self) -> &mut ReportReply {
+        self.report_reply.get_or_insert_with(ReportReply::default)
+    }
+
+    /// Sends the answer of a finished report event when no report act accepted the turn-in.
+    /// `wrong_target` is the error for an NPC/doodad that is not one of the quest's report
+    /// targets.
+    pub fn finish_report(&mut self, quest_id: u32, wrong_target: u8) {
+        let Some(reply) = self.report_reply.take() else {
+            // Active quest, but no report act is listening at this step.
+            self.send_report_refused(quest_id, quest_error::INVALID_QUEST_STATUS);
+            return;
+        };
+        if reply.accepted {
+            return;
+        }
+        let err = if reply.target_matched {
+            reply
+                .matched_refusal
+                .unwrap_or(quest_error::INVALID_QUEST_STATUS)
+        } else {
+            reply.mismatch_refusal.unwrap_or(wrong_target)
+        };
+        self.send_report_refused(quest_id, err);
     }
 
     fn quest(&self, h: QuestHandle) -> Option<&Quest> {
@@ -448,6 +512,19 @@ impl<'a> Ctx<'a> {
             }
         }
 
+        // Deviation: `SetStep` clears `ComponentId` (the final C# then sent 0 in the update of
+        // a step change), but the client plays the cinema of a non-dialog component only when
+        // an update names that component, and the pre-rewrite C# sent the current one. The
+        // component that completed the Progress step is named once, in this update. (Only
+        // Progress: `SCQuestContextStartedPacket` already named the Start component, and the
+        // client runs a named component's effects again for every packet that names it.)
+        let completed_component = if res {
+            self.quest(h)
+                .filter(|q| q.step == kind::PROGRESS)
+                .map_or(0, |q| q.component_id)
+        } else {
+            0
+        };
         if res {
             self.go_to_next_step(h);
         }
@@ -455,12 +532,34 @@ impl<'a> Ctx<'a> {
         // Send update to player
         if let Some(q) = self.quest(h) {
             if !q.skip_update {
-                let (row, cid) = (q.row(), q.component_id);
+                let named = completed_component != 0;
+                let cid = if named {
+                    completed_component
+                } else {
+                    q.component_id
+                };
+                let row = q.row();
                 let now = self.now_ms;
                 self.send(SCQuestContextUpdatedPacket::new(row, cid, now));
+                if named {
+                    self.expect_component_cinema(cid);
+                }
             }
         }
         res
+    }
+
+    /// An update named `component_id`: when the component has a cinema the client now plays it
+    /// (unless the component is dialog-driven), so the next `CSStartedCinemaPacket` is that
+    /// cinema (Rust addition; `events::request_cinema` for a running operation). A component
+    /// without a cinema leaves a pending request alone.
+    fn expect_component_cinema(&mut self, component_id: u32) {
+        if let Some(cinema_id) = self.data.component_cinema_id(component_id) {
+            self.st.requested_cinema = Some(CinemaMark {
+                cinema_id,
+                at_ms: self.now_ms,
+            });
+        }
     }
 
     /// `GoToNextStep`.
@@ -1792,6 +1891,7 @@ impl<'a> Ctx<'a> {
                 quest_id,
                 "the quest is not active",
             );
+            self.send_report_refused(quest_id, quest_error::INVALID_QUEST);
             return;
         };
         let let_it_done = self.data.template(quest_id).is_some_and(|t| t.let_it_done);
@@ -1801,6 +1901,7 @@ impl<'a> Ctx<'a> {
                 quest_id,
                 "the quest cannot be completed early (not LetItDone)",
             );
+            self.send_report_refused(quest_id, quest_error::INVALID_QUEST_STATUS);
             return;
         }
         let objective = self.objective_status(h);
@@ -1811,6 +1912,7 @@ impl<'a> Ctx<'a> {
                 quest_id,
                 &format!("objectives not far enough ({objective:?}, objectives {objectives:?})"),
             );
+            self.send_report_refused(quest_id, quest_error::INVALID_QUEST_STATUS);
             return;
         }
         if let Some(q) = self.quest_mut(h) {
@@ -1837,6 +1939,7 @@ impl<'a> Ctx<'a> {
                 tracing::warn!(
                     "TryCompleteQuestAsLetItDone, {who}, Quest {quest_id}: has no Reward step and its Ready step did not complete, left at Ready"
                 );
+                self.send_report_refused(quest_id, quest_error::INVALID_QUEST_STATUS);
             }
         } else {
             // Neither a Ready nor a Reward step: complete right away.
