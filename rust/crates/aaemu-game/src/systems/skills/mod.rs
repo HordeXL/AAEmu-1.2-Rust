@@ -56,6 +56,8 @@ mod buff_tests;
 #[cfg(test)]
 mod cast_validation_tests;
 #[cfg(test)]
+mod cooldown_persistence_tests;
+#[cfg(test)]
 mod death_once_tests;
 #[cfg(test)]
 mod doodad_item_gate_tests;
@@ -89,6 +91,8 @@ mod skill_tests;
 pub(crate) mod tests;
 #[cfg(test)]
 mod tl_id_flow_tests;
+#[cfg(test)]
+mod zone_buff_tests;
 
 use std::collections::{HashMap, HashSet};
 use std::sync::{Arc, Mutex, OnceLock, RwLock, Weak};
@@ -249,7 +253,6 @@ pub fn send_to_players(_server: &GameServer, units: &[WorldObject], packet: &dyn
 /// `CSMoveUnitPacket.RemoveEffects`: a moving velocity removes `RemoveOnMove` buffs
 /// (called by `world::session::move_unit` before the position update).
 pub fn on_move_request(server: &GameServer, unit: &PlayerRef, vel_x: i16, vel_y: i16, vel_z: i16) {
-    unit.data().unit.skill_state.moving = vel_x != 0 || vel_y != 0 || vel_z != 0;
     if vel_x != 0 || vel_y != 0 || vel_z != 0 {
         let obj = WorldObject::from(unit);
         buffs::trigger_remove_on(server, &obj, types::BuffRemoveOn::Move, 0);
