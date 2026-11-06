@@ -511,9 +511,8 @@ impl EconomyForSkills {
         );
     }
 
-    /// `Unit.ApplyEquipItemSetBonuses()`. The item procs of the set bonuses are not registered:
-    /// `UnitProcs.RollProcsForKind` skips every proc whose cooldown has elapsed (and
-    /// `LastProc` starts at `DateTime.MinValue`), so a C# proc never fires.
+    /// `Unit.ApplyEquipItemSetBonuses()`. The set procs are collected by
+    /// [`super::procs::refresh`] in the gear-bonus pass; this function keeps the buff part.
     fn apply_equip_item_set_bonuses(server: &GameServer, unit: &WorldObject, items: &[Item]) {
         use crate::systems::skills::buffs;
         let data = &server.game_data.items;
@@ -1430,6 +1429,10 @@ impl ItemSkillHooks for EconomyForSkills {
         Self::apply_weapon_wield_buff(server, unit);
         Self::apply_armor_grade_buff(server, unit, &items, added, removed);
         Self::apply_equip_item_set_bonuses(server, unit, &items);
+        // Set, item-binding and holdable procs of the current equipment. Rebuilt on every gear
+        // change (equip / unequip, gear break, repair, login, weapon-set swap, gem change), so
+        // the active set always matches the equipped items.
+        super::procs::refresh(server, unit, &items);
     }
 
     fn apply_effect(
@@ -3153,12 +3156,46 @@ impl crate::systems::npcs::hooks::EconomyBridge for EconomyForNpcs {
     }
 }
 
+/// Whether `template_id` is the doodad a trade pack turns into when it is put down or dropped on
+/// death (`PutDownBackpackEffect.BackpackDoodadId`). Its item sits in the owner's System
+/// container only for as long as the doodad stands, and the doodad's expiry
+/// (`DoodadFuncFinal.After`, 6 days for most packs) is what ends the pack's life.
+fn is_put_down_backpack_doodad(server: &GameServer, template_id: u32) -> bool {
+    server
+        .game_data
+        .systems
+        .skills
+        .effects
+        .get(&EffectKind::PutDownBackpackEffect)
+        .is_some_and(|effects| {
+            effects.values().any(|e| {
+                matches!(e, EffectTemplate::PutDownBackpack { backpack_doodad_id, .. }
+                    if *backpack_doodad_id == template_id)
+            })
+        })
+}
+
+/// Another live doodad that still references `item_id` (a duplicate of the expired doodad).
+fn item_referenced_by_live_doodad(server: &GameServer, item_id: u64) -> bool {
+    server.world.worlds().iter().any(|world| {
+        world.all_doodads().iter().any(|d| {
+            let d = d.data();
+            !d.phase.deleted && d.item_id == item_id
+        })
+    })
+}
+
 /// Original rack references cannot authorize destruction after GUID reuse, regardless of the
 /// current item's class. Other doodads may remove only a unique, matching singleton in their
 /// original character owner's System escrow. Bag/equipment/bank, loose, foreign and mismatched
 /// items are retained. These checks establish escrow authority, not an allocation generation.
 /// Cargo/ambiguous item references and all saved container references still need reconciliation;
 /// these synchronous hooks do not prove absence of unloaded aliases or collect those orphans.
+///
+/// Exception: a put-down / dropped trade pack. Its doodad is the pack's only reference (the
+/// escrow check below still has to hold), so when it expires the pack goes with it, as in the C#
+/// (`Doodad.Delete`: "Delete associated item if expired"). Retaining it left every expired
+/// pack behind in its owner's System container for good.
 fn cleanup_doodad_escrow_item(
     txn: &mut ItemTxn<'_>,
     source: crate::systems::npcs::hooks::DoodadItemCleanup,
@@ -3187,8 +3224,12 @@ fn cleanup_doodad_escrow_item(
         ),
         _ => false,
     };
+    let dropped_pack = !rack
+        && source.owner_type != doodad_owner_type::SLAVE
+        && is_put_down_backpack_doodad(server, source.doodad_template_id)
+        && !item_referenced_by_live_doodad(server, source.item_id);
     if rack
-        || cargo
+        || (cargo && !dropped_pack)
         || source.owner_type == doodad_owner_type::SLAVE
         || !matches!(
             source.owner_type,
@@ -4377,3 +4418,7 @@ pub fn install(server: &GameServer) {
 #[cfg(test)]
 #[path = "cargo_flow_tests.rs"]
 mod cargo_flow_tests;
+
+#[cfg(test)]
+#[path = "pack_expiry_tests.rs"]
+mod pack_expiry_tests;
