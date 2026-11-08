@@ -337,7 +337,7 @@ pub fn after_death(server: &GameServer, npc: &NpcRef, _killer: Option<&WorldObje
         let none_left = p.data().skill_char.is_in_aggro_list_of.is_empty();
         if none_left {
             // Cancel combat
-            p.data().unit.is_in_battle = false;
+            crate::systems::skills::combat::set_in_battle(server, &WorldObject::from(p), false);
         }
     }
     {

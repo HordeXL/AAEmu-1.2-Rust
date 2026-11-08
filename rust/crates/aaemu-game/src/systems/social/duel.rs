@@ -797,8 +797,8 @@ impl DuelManager {
         }
 
         // The players cannot be attacked any more.
-        duel.challenger.data().unit.is_in_battle = false;
-        duel.challenged.data().unit.is_in_battle = false;
+        crate::systems::skills::combat::set_in_battle(server, &WorldObject::from(&duel.challenger), false);
+        crate::systems::skills::combat::set_in_battle(server, &WorldObject::from(&duel.challenged), false);
 
         self.duel_clean_up(id);
     }
