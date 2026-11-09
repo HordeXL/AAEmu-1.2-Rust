@@ -317,6 +317,10 @@ fn owner_pos(c: &AiCtx<'_>) -> Vec3 {
     npc::world_pos(c.server, &c.obj)
 }
 
+/// The reach of the melee base skill (id 2): the `PickSkillAndUseIt` guard distance and the cap
+/// of the `MoveInRange` stop distance.
+const MELEE_ATTACK_RANGE: f32 = 4.0;
+
 /// `Behavior.PickSkillAndUseIt(kind, target, targetDist)`.
 pub fn pick_skill_and_use_it(
     c: &mut AiCtx<'_>,
@@ -376,10 +380,6 @@ pub fn pick_skill_and_use_it(
     if !skills.is_empty() {
         picked = skills[rand::thread_rng().gen_range(0..skills.len())];
     }
-    // Hackfix for Melee attack. Needs to look at the held weapon (if any) or default to 3m
-    if picked == 2 && target_dist > 4.0 {
-        return skill_result::TOO_FAR_RANGE;
-    }
     let Some(skill) = ai_skills::new_skill(c, picked) else {
         // new Skill(null) throws NullReferenceException in the C#.
         tracing::error!(
@@ -388,7 +388,14 @@ pub fn pick_skill_and_use_it(
         );
         return res;
     };
-    set_weapon_range(c, k, &skill, target);
+    // Deviation from the C#: SetWeaponRange runs before the melee hackfix below. The C# returned
+    // TOO_FAR_RANGE first, so after a ranged skill went on cooldown the stale (long) weapon range
+    // kept MoveInRange parking the NPC at that range while it only had skill 2 to use.
+    set_weapon_range(c, k, &skill);
+    // Hackfix for Melee attack. Needs to look at the held weapon (if any) or default to 3m
+    if picked == 2 && target_dist > MELEE_ATTACK_RANGE {
+        return skill_result::TOO_FAR_RANGE;
+    }
     let mut delay2 = (t.base_skill_delay * 1000.0) as i64;
     if t.base_skill_delay == 0.0 {
         delay2 = rand::thread_rng().gen_range(1500..1550);
@@ -706,7 +713,6 @@ fn set_weapon_range(
     c: &mut AiCtx<'_>,
     k: BehaviorKind,
     skill: &crate::systems::skills::state::SkillRef,
-    target: &WorldObject,
 ) {
     let skill_range = crate::systems::skills::skill::apply_skill_modifiers(
         c.server,
@@ -718,9 +724,11 @@ fn set_weapon_range(
     let mut min_range_check = f64::from(skill.template.min_range);
     let mut max_range_check = skill_range;
     if skill.template.weapon_slot_for_range_id > 0 {
+        // Deviation from the C#: the range comes from the NPC's own weapon. The C# read the
+        // target's (the player's) holdable, so the chase range followed the player's weapon.
         let (mut min_w, mut max_w) = (0.0f32, 3.0f32); // Fist default
         if let Some(h) =
-            ai_skills::weapon_holdable(c, target, skill.template.weapon_slot_for_range_id)
+            ai_skills::weapon_holdable(c, &c.obj, skill.template.weapon_slot_for_range_id)
         {
             min_w = h.0;
             max_w = h.1;
@@ -728,9 +736,19 @@ fn set_weapon_range(
         min_range_check = f64::from(min_w);
         max_range_check = f64::from(max_w);
     }
+    let mut max_range_check = max_range_check as f32;
+    // Deviation from the C#: MoveInRange stops at `attack_start_range_scale * max_weapon_range`,
+    // but the melee base skill (id 2) is only used within MELEE_ATTACK_RANGE. Cap the chase range
+    // so a scale above 1 (or a long-range holdable) cannot park the NPC out of melee reach.
+    if skill.id == 2 {
+        let scale = template_scalars(c).attack_start_range_scale;
+        if scale > 0.0 {
+            max_range_check = max_range_check.min(MELEE_ATTACK_RANGE / scale);
+        }
+    }
     let s = c.st(k);
     s.min_weapon_range = min_range_check as f32;
-    s.max_weapon_range = max_range_check as f32;
+    s.max_weapon_range = max_range_check;
 }
 
 /// `Behavior.CheckFollowPath()`.
@@ -806,7 +824,10 @@ fn update_target(c: &mut AiCtx<'_>) -> bool {
     if npc::skill_controller_running(&c.obj) {
         return current_target(c).is_some();
     }
-    let abusers = sorted_abusers(c);
+    let mut abusers = sorted_abusers(c);
+    if c.server.config.ai.pull_aggro_enabled {
+        apply_pull_aggro(c, &mut abusers);
+    }
     for abuser in abusers {
         let Some(abuser) = abuser else { continue };
         if geo_data_mode(c) {
@@ -856,6 +877,14 @@ fn update_target(c: &mut AiCtx<'_>) -> bool {
 /// taunt stamp sorts above every unstamped entry and the latest stamp wins. Unstamped entries
 /// keep the total order; the stable sort keeps the table (obj id) order on ties.
 fn sorted_abusers(c: &AiCtx<'_>) -> Vec<Option<WorldObject>> {
+    sorted_entries(c)
+        .into_iter()
+        .map(|(id, _, _)| c.server.world.object(id))
+        .collect()
+}
+
+/// The aggro table as `(obj id, total, taunt stamp)` in the order of [`sorted_abusers`].
+fn sorted_entries(c: &AiCtx<'_>) -> Vec<(u32, i32, u64)> {
     let mut entries: Vec<(u32, i32, u64)> = c
         .npc
         .data()
@@ -872,9 +901,78 @@ fn sorted_abusers(c: &AiCtx<'_>) -> Vec<Option<WorldObject>> {
         (x, y) => y.cmp(&x),
     });
     entries
-        .into_iter()
-        .map(|(id, _, _)| c.server.world.object(id))
-        .collect()
+}
+
+/// Whether `update_target` would accept `abuser` as the target (visible, alive and, without
+/// geodata, present in the world).
+fn abuser_is_valid(c: &AiCtx<'_>, abuser: &WorldObject) -> bool {
+    if !npc::unit_is_visible(c.server, &c.obj, abuser) || npc::is_dead(abuser) {
+        return false;
+    }
+    geo_data_mode(c)
+        || (abuser.obj_id() > 0
+            && super::npc::world_unit(c.server, &c.obj, abuser.obj_id()).is_some())
+}
+
+/// Pull aggro (added deviation, `PORTING.md`, config `Ai.PullAggro*`): the NPC keeps its valid
+/// current aggro target until a challenger beats it. A taunt stamp beats an unstamped target
+/// (and an earlier stamp); otherwise the challenger's total has to exceed the target's total
+/// times the melee or ranged ratio. The chosen entry is moved to the front of `abusers`, so
+/// the normal selection loop picks it; with no valid current target nothing changes.
+fn apply_pull_aggro(c: &AiCtx<'_>, abusers: &mut Vec<Option<WorldObject>>) {
+    let current_id = c.npc.data().current_aggro_target;
+    if current_id == 0 {
+        return;
+    }
+    let entries = sorted_entries(c);
+    let Some(&(_, cur_total, cur_taunt)) = entries.iter().find(|e| e.0 == current_id) else {
+        return;
+    };
+    let Some(current) = c.server.world.object(current_id) else {
+        return;
+    };
+    if !abuser_is_valid(c, &current) {
+        return;
+    }
+    let cfg = &c.server.config.ai;
+    let base = f64::from(cur_total.max(0));
+    let mut chosen = current_id;
+    for &(id, total, taunt) in &entries {
+        if id == current_id {
+            continue;
+        }
+        let Some(challenger) = c.server.world.object(id) else {
+            continue;
+        };
+        if !abuser_is_valid(c, &challenger) {
+            continue;
+        }
+        let wins = if taunt != 0 {
+            cur_taunt == 0 || taunt > cur_taunt
+        } else if cur_taunt != 0 {
+            false
+        } else {
+            let melee =
+                npc::distance_to(c.server, &c.obj, &challenger, true) <= cfg.pull_aggro_melee_range;
+            let ratio = if melee {
+                cfg.pull_aggro_melee_ratio
+            } else {
+                cfg.pull_aggro_ranged_ratio
+            };
+            f64::from(total) > base * ratio
+        };
+        if wins {
+            chosen = id;
+            break;
+        }
+    }
+    if let Some(i) = abusers
+        .iter()
+        .position(|a| a.as_ref().is_some_and(|a| a.obj_id() == chosen))
+    {
+        let entry = abusers.remove(i);
+        abusers.insert(0, entry);
+    }
 }
 
 /// Drops the chase route and its bookkeeping, so the next chase step plans from scratch.
@@ -2104,8 +2202,13 @@ fn tick_current_ai_command(c: &mut AiCtx<'_>, delta_ms: i64) {
                     c.server, &c.obj, skill_id, &target,
                 );
                 if r == skill_result::SUCCESS {
+                    // The AI casts through `unit_use_skill`, whose NPC skills run at the
+                    // unit level (`ab_level_override` / level): pace the command with the
+                    // same effective level the cast uses.
+                    let level =
+                        crate::systems::skills::skill::ab_level(c.server, &c.obj, tpl.ability_id);
                     let cool_down = crate::systems::skills::skill::attack_delay(
-                        c.server, &tpl, &c.obj, false, 0.0,
+                        c.server, &tpl, level, &c.obj, false, 0.0,
                     );
                     c.ai.current_command_run_time_ms = cool_down as i64;
                 }
@@ -2781,7 +2884,7 @@ fn wild_boar_attack_tick(c: &mut AiCtx<'_>, k: BehaviorKind, delta_ms: i64) {
             if target_dist >= skill.template.min_range as f32
                 && target_dist <= skill.template.max_range as f32
             {
-                set_weapon_range(c, k, &skill, &target);
+                set_weapon_range(c, k, &skill);
                 let result = use_skill(c, k, skill, Some(&target), 0.0);
                 if result == skill_result::COOLDOWN_TIME {
                     pick_skill_and_use_it(
