@@ -81,7 +81,7 @@ fn install_crest_printers(doodad: &mut DoodadData) {
         .insert(22729, vec![func(22729, 19145, 4)]);
 }
 
-fn test_server() -> GameServer {
+fn test_config() -> AppConfig {
     let mut config = AppConfig {
         id: 1,
         ..AppConfig::default()
@@ -90,9 +90,19 @@ fn test_server() -> GameServer {
     config.network.num_connections = 10;
     config.connections.mysql_provider.host = "127.0.0.1".into();
     config.connections.mysql_provider.port = 1; // nothing listens here
+    config
+}
+
+fn test_server() -> GameServer {
+    let config = test_config();
     let db = MySqlPoolOptions::new()
         .acquire_timeout(Duration::from_millis(300))
         .connect_lazy_with(config.connections.mysql_provider.connect_options());
+    test_server_with_db(config, db)
+}
+
+/// [`test_server`] with a caller-built pool (the MySQL-gated two-upload test).
+fn test_server_with_db(config: AppConfig, db: sqlx::mysql::MySqlPool) -> GameServer {
     let mut data = GameData::empty();
     // `ConfirmDefaultUcc` creates a Crest Ink (the C# hack-fix template).
     data.items.templates.insert(
@@ -125,6 +135,15 @@ fn bytes(f: impl FnOnce(&mut PacketStream)) -> Vec<u8> {
     let mut s = PacketStream::new();
     f(&mut s);
     s.into_bytes()
+}
+
+fn join_frame(account_id: u32, ticket: u32) -> Vec<u8> {
+    frame(
+        ct::CT_JOIN,
+        &bytes(|s| {
+            s.write_u32(account_id).write_u32(ticket);
+        }),
+    )
 }
 
 fn enc(p: &dyn StreamServerPacket) -> Vec<u8> {
@@ -255,7 +274,14 @@ fn appearance() -> Vec<u8> {
 
 /// Server with a joined stream connection (id 900) bound to game connection 77.
 async fn joined(world: Arc<TestWorld>) -> (GameServer, StreamClient, GameClient) {
-    let server = test_server();
+    joined_with(test_server(), world).await
+}
+
+/// [`joined`] on a caller-built server (the MySQL-gated upload test).
+async fn joined_with(
+    server: GameServer,
+    world: Arc<TestWorld>,
+) -> (GameServer, StreamClient, GameClient) {
     server.streams.set_world(world);
     let g = game_connection(&server, 77);
     // The ActiveChar of game connection 77 (character 555, as `TestWorld::active_character`).
@@ -263,7 +289,7 @@ async fn joined(world: Arc<TestWorld>) -> (GameServer, StreamClient, GameClient)
     character.money = 100;
     let p = crate::world::Player::new(character, g.0.handle());
     assert!(server.world.try_add_character(&p));
-    assert!(server.streams.add_token(1000, 77));
+    assert!(server.streams.add_token_with_ticket(1000, 77, 77));
     let mut c = stream_client(&server, 900);
     c.recv(
         &server,
@@ -311,9 +337,20 @@ fn printer_1470() -> StreamDoodad {
 /// [`joined`] plus a synthetic world instance 0 with the live doodad `p` (at 2 m from the
 /// player). The stream fake answers `doodad()` from the same snapshot.
 async fn joined_printer(p: StreamDoodad) -> (GameServer, StreamClient, GameClient) {
-    let (server, c, g) = joined(Arc::new(TestWorld {
-        doodads: vec![p.clone()],
-    }))
+    joined_printer_with(test_server(), p).await
+}
+
+/// [`joined_printer`] on a caller-built server (the MySQL-gated upload test).
+async fn joined_printer_with(
+    server: GameServer,
+    p: StreamDoodad,
+) -> (GameServer, StreamClient, GameClient) {
+    let (server, c, g) = joined_with(
+        server,
+        Arc::new(TestWorld {
+            doodads: vec![p.clone()],
+        }),
+    )
     .await;
     server.world.create_world_instance(
         Arc::new(crate::data::world_templates::WorldTemplate::synthetic(
@@ -684,71 +721,60 @@ fn registered_opcodes_match_ct_offsets() {
 #[tokio::test]
 async fn join_with_token_from_enter_world() {
     let server = Arc::new(test_server());
-    // login -> game: LGPlayerEnter(account 1000, connection 4242)
+    // login -> game: LGPlayerEnter(account 1000, connection 4242); the game issues the cookie
+    let (login_tx, mut login_rx) = tokio::sync::mpsc::unbounded_channel();
+    server.login.set(Some(login_tx));
     assert!(crate::login::handle(&server, &hex("01 00  E8 03 00 00  92 10 00 00")).await);
-    // X2EnterWorld(account 1000, cookie 4242) on game connection 77 -> StreamManager.AddToken
+    let reply = login_rx.try_recv().unwrap();
+    let cookie = reply[16..20].to_vec();
+    // X2EnterWorld(account 1000, that cookie) on game connection 77 -> StreamManager.AddToken
     let mut g = game_connection(&server, 77);
     let mut x2 = vec![0xDD, 0x01, 0x00, 0x00];
     x2.extend_from_slice(&cs::X2EnterWorldPacket.to_le_bytes());
-    x2.extend(hex(
-        "00 00 00 00  00 00 00 00  E8 03 00 00  92 10 00 00  00 00 00 00  00",
-    ));
+    x2.extend(hex("00 00 00 00  00 00 00 00  E8 03 00 00"));
+    x2.extend(cookie);
+    x2.extend(hex("00 00 00 00  00"));
     x2.extend_from_slice(&[0; 8]);
     server.handle_frame(&mut g.0, &x2).await.unwrap();
-    assert_eq!(server.streams.account_for(77), Some(1000));
+    // The join ticket is random, not the connection id.
+    let ticket = server.streams.ticket_for(77).expect("ticket");
+    assert_ne!(ticket, 0);
+    assert_eq!(server.streams.account_for(ticket), Some(1000));
+    assert_eq!(server.streams.account_for(77), None);
 
-    // Stream join with the game connection id as cookie -> accepted, linked to game conn 77.
+    // Stream join with the ticket -> accepted, linked to game conn 77.
     let mut s = stream_client(&server, 900);
-    s.recv(
-        &server,
-        &frame(ct::CT_JOIN, &hex("E8 03 00 00  4D 00 00 00")),
-    )
-    .await
-    .unwrap();
+    s.recv(&server, &join_frame(1000, ticket)).await.unwrap();
     assert_eq!(s.drain(), vec![hex("01 00 00")]);
     assert_eq!(s.conn.game_connection_id, Some(77));
     assert!(!s.conn.is_closing());
 
-    // The token is not consumed: a second stream connection may join too.
+    // The ticket is not consumed: a second stream connection may join too.
     let mut s2 = stream_client(&server, 901);
-    s2.recv(
-        &server,
-        &frame(ct::CT_JOIN, &hex("E8 03 00 00  4D 00 00 00")),
-    )
-    .await
-    .unwrap();
+    s2.recv(&server, &join_frame(1000, ticket)).await.unwrap();
     assert_eq!(s2.drain(), vec![hex("01 00 00")]);
 
-    // Unknown token -> response 1, connection stays open, not linked.
+    // The game connection id is not a ticket.
     let mut bad = stream_client(&server, 902);
-    bad.recv(
-        &server,
-        &frame(ct::CT_JOIN, &hex("E8 03 00 00  63 00 00 00")),
-    )
-    .await
-    .unwrap();
+    bad.recv(&server, &join_frame(1000, 77)).await.unwrap();
     assert_eq!(bad.drain(), vec![hex("01 00 01")]);
     assert_eq!(bad.conn.game_connection_id, None);
     assert!(!bad.conn.is_closing());
 
-    // Known token, wrong account -> response 1 and the token is removed (C# behaviour), so the
-    // legitimate account can no longer join with it.
-    bad.recv(
-        &server,
-        &frame(ct::CT_JOIN, &hex("05 00 00 00  4D 00 00 00")),
-    )
-    .await
-    .unwrap();
+    // Known ticket, wrong account -> response 1 and the owner's ticket stays usable (the C#
+    // removed the token, which let anyone break another player's stream session).
+    bad.recv(&server, &join_frame(5, ticket)).await.unwrap();
     assert_eq!(bad.drain(), vec![hex("01 00 01")]);
-    assert_eq!(server.streams.account_for(77), None);
+    assert_eq!(server.streams.account_for(ticket), Some(1000));
     let mut s3 = stream_client(&server, 903);
-    s3.recv(
-        &server,
-        &frame(ct::CT_JOIN, &hex("E8 03 00 00  4D 00 00 00")),
-    )
-    .await
-    .unwrap();
-    assert_eq!(s3.drain(), vec![hex("01 00 01")]);
+    s3.recv(&server, &join_frame(1000, ticket)).await.unwrap();
+    assert_eq!(s3.drain(), vec![hex("01 00 00")]);
+
+    // The ticket dies with the game connection.
+    server.streams.remove_token(77);
+    let mut s4 = stream_client(&server, 904);
+    s4.recv(&server, &join_frame(1000, ticket)).await.unwrap();
+    assert_eq!(s4.drain(), vec![hex("01 00 01")]);
 }
 
 #[tokio::test]
@@ -802,7 +828,7 @@ async fn unknown_packet_before_join_closes_the_connection() {
 async fn unknown_packet_after_join_is_ignored() {
     let server = test_server();
     let _g = game_connection(&server, 77);
-    server.streams.add_token(1000, 77);
+    server.streams.add_token_with_ticket(1000, 77, 77);
     let mut s = stream_client(&server, 900);
     s.recv(
         &server,
@@ -831,8 +857,19 @@ async fn unknown_packet_after_join_is_ignored() {
 async fn no_game_connection_or_active_char_is_fatal_for_ucc_requests() {
     let server = test_server();
     server.streams.ucc.insert(custom_ucc(9, 10));
+    // Not joined: only CTJoin is served, anything else closes the connection (the C# threw a
+    // NullReferenceException on connection.GameConnection).
+    let mut s = stream_client(&server, 899);
+    s.recv(&server, &frame(ct::CT_REQUEST_EMBLEM, &9u64.to_le_bytes()))
+        .await
+        .unwrap();
+    assert!(s.conn.is_closing());
+    // Joined to a game connection that has no active character.
+    let _g = game_connection(&server, 78);
+    assert!(server.streams.add_token_with_ticket(1001, 78, 78));
     let mut s = stream_client(&server, 900);
-    // Not joined: connection.GameConnection is null -> NullReferenceException in C#.
+    s.recv(&server, &join_frame(1001, 78)).await.unwrap();
+    assert_eq!(s.drain(), vec![hex("01 00 00")]);
     assert!(s
         .recv(&server, &frame(ct::CT_REQUEST_EMBLEM, &9u64.to_le_bytes()))
         .await
@@ -938,7 +975,11 @@ async fn cell_streaming_in_batches_of_30() {
 #[tokio::test]
 async fn null_world_serves_empty_cells() {
     let server = test_server();
+    let _g = game_connection(&server, 77);
+    server.streams.add_token_with_ticket(1000, 77, 77);
     let mut c = stream_client(&server, 900);
+    c.recv(&server, &join_frame(1000, 77)).await.unwrap();
+    assert_eq!(c.drain(), vec![hex("01 00 00")]);
     c.recv(
         &server,
         &frame(
@@ -1174,7 +1215,7 @@ async fn ucc_custom_upload() {
     let (server, mut c, mut g) = joined_printer(printer_3038()).await;
     let p = server.world.character_by_connection(77).unwrap();
     p.data().money = 50_000;
-    give_item(&server, &p, ITEM_CREST_BRAINSTORM, 1);
+    give_item(&server, &p, ITEM_CREST_BRAINSTORM, 2);
     let start = start_upload_body(PRINTER_OBJ, 5);
     c.recv(&server, &frame(ct::CT_START_UPLOAD_EMBLEM_STREAM, &start))
         .await
@@ -1227,8 +1268,227 @@ async fn ucc_custom_upload() {
         ),
         "no money task on a custom upload"
     );
-    // The save failed before the Crest Ink went to the bag, the reagent is gone and the money
-    // is untouched.
+    // The save failed before the Crest Ink went to the bag, one reagent was spent (one is left
+    // for the second upload) and the money is untouched.
+    assert_eq!(p.data().money, 50_000);
+    assert_eq!(
+        crate::systems::economy::inventory::Inv::of(&p).items_count_in_unlocked(
+            crate::models::container::slot_type::INVENTORY,
+            ITEM_CREST_BRAINSTORM,
+            -1
+        ),
+        1
+    );
+    assert!(
+        bag_items(&p)
+            .iter()
+            .all(|i| i.template_id == ITEM_CREST_BRAINSTORM),
+        "no Crest Ink in the bag before the save succeeds"
+    );
+
+    // The upload finished: the per-connection upload state is gone, so a **second** custom
+    // upload on the same stream connection starts instead of throwing (the C# never cleared
+    // `_complexUploadParts` and closed the connection here).
+    assert_eq!(server.streams.ucc.parts_len(), 0);
+    assert_eq!(server.streams.ucc.queue_len(), 0);
+    assert_eq!(
+        crate::systems::economy::inventory::Inv::of(&p).items_count_in_unlocked(
+            crate::models::container::slot_type::INVENTORY,
+            ITEM_CREST_BRAINSTORM,
+            -1
+        ),
+        1,
+        "one reagent left for the second upload"
+    );
+
+    c.recv(&server, &frame(ct::CT_START_UPLOAD_EMBLEM_STREAM, &start))
+        .await
+        .unwrap();
+    assert_eq!(c.drain(), vec![hex("0A 00  00 00 00 00 00")]);
+    c.recv(
+        &server,
+        &frame(
+            ct::CT_UPLOAD_EMBLEM_STREAM,
+            &hex("05 00 00 00  03 00 00 00  00 00 00 00  03 00  11 22 33"),
+        ),
+    )
+    .await
+    .unwrap();
+    assert_eq!(c.drain(), vec![hex("0A 00  00 00 00 00 00")]);
+    // The second upload also completes and reaches its own ConfirmDefaultUcc / save step.
+    let res = c
+        .recv(
+            &server,
+            &frame(
+                ct::CT_UPLOAD_EMBLEM_STREAM,
+                &hex("05 00 00 00  02 00 00 00  01 00 00 00  02 00  44 55"),
+            ),
+        )
+        .await;
+    assert!(res.is_err());
+    assert_eq!(c.drain(), vec![hex("0A 00  02  00 00 00 00")]);
+    let stored = server
+        .streams
+        .ucc
+        .get_ucc(2)
+        .expect("second custom UCC registered");
+    assert_eq!(stored.ty, UccType::Complex);
+    assert_eq!(stored.uploader_id, 555);
+    assert_eq!(stored.data, vec![0x11, 0x22, 0x33, 0x44, 0x55]);
+    assert_eq!(server.streams.ucc.parts_len(), 0);
+    assert_eq!(server.streams.ucc.queue_len(), 0);
+
+    // One charge per upload is proven by the reagent balance (2 -> 1 -> 0, asserted above and
+    // below), not by counting frames: the first upload's frame was drained earlier, and emptying
+    // the stack in the second upload sends two IMPRINT_UCC tasks (the removed slot, then the empty
+    // list `consume_item_filtered` always sends). No money task.
+    let frames = game_frames(&mut g);
+    assert!(
+        !frames.iter().any(
+            |(op, body)| *op == crate::opcodes::sc::SCItemTaskSuccessPacket
+                && body.first() == Some(&task_type::DEPOSIT_MONEY)
+        ),
+        "no money task on a custom upload"
+    );
+    assert_eq!(p.data().money, 50_000);
+    assert_eq!(
+        crate::systems::economy::inventory::Inv::of(&p).items_count_in_unlocked(
+            crate::models::container::slot_type::INVENTORY,
+            ITEM_CREST_BRAINSTORM,
+            -1
+        ),
+        0,
+        "one reagent per upload"
+    );
+}
+
+/// `CTEmblemStreamUploadStatus` (`ConfirmDefaultUcc`) during a custom upload must not charge
+/// the reagent and save an empty Complex UCC: the interleaved packet order is refused and the
+/// in-progress upload is left untouched.
+#[tokio::test]
+async fn ucc_default_confirm_during_a_custom_upload_is_refused() {
+    let (server, mut c, mut g) = joined_printer(printer_3038()).await;
+    let p = server.world.character_by_connection(77).unwrap();
+    p.data().money = 50_000;
+    give_item(&server, &p, ITEM_CREST_BRAINSTORM, 1);
+    let start = start_upload_body(PRINTER_OBJ, 5);
+    c.recv(&server, &frame(ct::CT_START_UPLOAD_EMBLEM_STREAM, &start))
+        .await
+        .unwrap();
+    assert_eq!(c.drain(), vec![hex("0A 00  00 00 00 00 00")]);
+    c.recv(
+        &server,
+        &frame(
+            ct::CT_UPLOAD_EMBLEM_STREAM,
+            &hex("05 00 00 00  03 00 00 00  00 00 00 00  03 00  AA BB CC"),
+        ),
+    )
+    .await
+    .unwrap();
+    assert_eq!(c.drain(), vec![hex("0A 00  00 00 00 00 00")]);
+
+    let res = c
+        .recv(&server, &frame(ct::CT_EMBLEM_STREAM_UPLOAD_STATUS, &[1]))
+        .await;
+    assert!(res.is_err(), "the confirm is refused");
+    assert!(server.streams.ucc.is_empty(), "no UCC saved");
+    assert_eq!(p.data().money, 50_000);
+    assert_eq!(
+        crate::systems::economy::inventory::Inv::of(&p).items_count_in_unlocked(
+            crate::models::container::slot_type::INVENTORY,
+            ITEM_CREST_BRAINSTORM,
+            -1
+        ),
+        1,
+        "the reagent is not charged"
+    );
+    assert!(game_frames(&mut g).is_empty(), "no item task sent");
+    assert_eq!(
+        server.streams.ucc.parts_len(),
+        1,
+        "upload still in progress"
+    );
+    assert_eq!(server.streams.ucc.queue_len(), 1);
+}
+
+/// The MySQL half of [`ucc_custom_upload`]: with a real database both custom uploads on the
+/// same stream connection save, so the client gets `End` twice and two `uccs` rows exist.
+#[tokio::test]
+#[ignore = "requires private MySQL3317 via AAEMU_TEST_MYSQL; uses a temporary uccs table"]
+async fn ucc_two_custom_uploads_on_one_connection_are_saved() {
+    use crate::systems::social::achievement_persistence::temporary_shadow_definition;
+    use sqlx::mysql::{MySqlConnectOptions, MySqlPoolOptions};
+    use std::str::FromStr;
+
+    let Ok(url) = std::env::var("AAEMU_TEST_MYSQL") else {
+        return;
+    };
+    let options = MySqlConnectOptions::from_str(&url).expect("valid private MySQL URL");
+    assert_eq!(
+        options.get_port(),
+        3317,
+        "only private MySQL3317 is allowed"
+    );
+    let pool = MySqlPoolOptions::new()
+        .max_connections(1)
+        .connect_with(options)
+        .await
+        .expect("private MySQL");
+    let (_, definition): (String, String) = sqlx::query_as("SHOW CREATE TABLE `uccs`")
+        .fetch_one(&pool)
+        .await
+        .unwrap();
+    sqlx::query(&temporary_shadow_definition(&definition))
+        .execute(&pool)
+        .await
+        .unwrap();
+
+    let (server, mut c, mut g) = joined_printer_with(
+        test_server_with_db(test_config(), pool.clone()),
+        printer_3038(),
+    )
+    .await;
+    let p = server.world.character_by_connection(77).unwrap();
+    p.data().money = 50_000;
+    give_item(&server, &p, ITEM_CREST_BRAINSTORM, 2);
+    let start = start_upload_body(PRINTER_OBJ, 5);
+    for (first, last) in [
+        (
+            "05 00 00 00  03 00 00 00  00 00 00 00  03 00  AA BB CC",
+            "05 00 00 00  02 00 00 00  01 00 00 00  02 00  DD EE",
+        ),
+        (
+            "05 00 00 00  03 00 00 00  00 00 00 00  03 00  11 22 33",
+            "05 00 00 00  02 00 00 00  01 00 00 00  02 00  44 55",
+        ),
+    ] {
+        c.recv(&server, &frame(ct::CT_START_UPLOAD_EMBLEM_STREAM, &start))
+            .await
+            .expect("start upload");
+        assert_eq!(c.drain(), vec![hex("0A 00  00 00 00 00 00")]);
+        c.recv(&server, &frame(ct::CT_UPLOAD_EMBLEM_STREAM, &hex(first)))
+            .await
+            .expect("first part");
+        assert_eq!(c.drain(), vec![hex("0A 00  00 00 00 00 00")]);
+        c.recv(&server, &frame(ct::CT_UPLOAD_EMBLEM_STREAM, &hex(last)))
+            .await
+            .expect("last part saves");
+        assert_eq!(c.drain(), vec![hex("0A 00  02  00 00 00 00")]);
+    }
+    let rows: Vec<(i64, i64)> = sqlx::query_as(
+        "SELECT CAST(id AS SIGNED), CAST(uploader_id AS SIGNED) FROM uccs ORDER BY id",
+    )
+    .fetch_all(&pool)
+    .await
+    .unwrap();
+    assert_eq!(rows.len(), 2, "{rows:?}");
+    assert_eq!(rows[0], (1, 555));
+    assert_eq!(rows[1], (2, 555));
+    assert_eq!(
+        server.streams.ucc.get_ucc(2).expect("second UCC").data,
+        vec![0x11, 0x22, 0x33, 0x44, 0x55]
+    );
+    // Two saved uploads: one reagent and one Crest Ink each, no money.
     assert_eq!(p.data().money, 50_000);
     assert_eq!(
         crate::systems::economy::inventory::Inv::of(&p).items_count_in_unlocked(
@@ -1238,17 +1498,35 @@ async fn ucc_custom_upload() {
         ),
         0
     );
-    assert!(bag_items(&p).is_empty());
-
-    // C# never clears _complexUploadParts: a second custom upload on the same stream
-    // connection throws. The pre-checks need money and the reagent again so the packet reaches
-    // the queue.
-    p.data().money = 50_000;
-    give_item(&server, &p, ITEM_CREST_BRAINSTORM, 1);
-    assert!(c
-        .recv(&server, &frame(ct::CT_START_UPLOAD_EMBLEM_STREAM, &start))
-        .await
-        .is_err());
+    assert_eq!(
+        crate::systems::economy::inventory::Inv::of(&p).items_count_in_unlocked(
+            crate::models::container::slot_type::INVENTORY,
+            ITEM_CREST_INK,
+            -1
+        ),
+        2,
+        "one Crest Ink gained per upload"
+    );
+    let frames = game_frames(&mut g);
+    assert_eq!(
+        frames
+            .iter()
+            .filter(
+                |(op, body)| *op == crate::opcodes::sc::SCItemTaskSuccessPacket
+                    && body.first() == Some(&task_type::GAIN_ITEM_WITH_UCC)
+            )
+            .count(),
+        2,
+        "one Crest Ink item task per upload"
+    );
+    assert!(
+        !frames.iter().any(
+            |(op, body)| *op == crate::opcodes::sc::SCItemTaskSuccessPacket
+                && body.first() == Some(&task_type::DEPOSIT_MONEY)
+        ),
+        "no money task on a custom upload"
+    );
+    pool.close().await;
 }
 
 /// The frames a game connection received, as (opcode, body) (level-1 frames only).
@@ -1589,7 +1867,7 @@ fn real_stamp_maker_rows_resolve_to_expected_cost() {
 async fn socket_round_trip() {
     let server = Arc::new(test_server());
     let _g = game_connection(&server, 77);
-    server.streams.add_token(1000, 77);
+    server.streams.add_token_with_ticket(1000, 77, 77);
     let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
     let addr = listener.local_addr().unwrap();
     let task = tokio::spawn(super::listener::serve_listener(server.clone(), listener));
@@ -1695,4 +1973,164 @@ async fn socket_closes_connections_that_never_join() {
         assert_eq!(n, 0);
     }
     task.abort();
+}
+
+// ---------------------------------------------------------------------------------------------
+// Hardening (Rust addition)
+
+/// Before `CTJoin` only `CTJoin` is served: registered packets close the connection too.
+#[tokio::test]
+async fn registered_packets_before_join_close_the_connection() {
+    let server = test_server();
+    server.streams.ucc.insert(custom_ucc(9, 10));
+    for (opcode, body) in [
+        (
+            ct::CT_REQUEST_CELL,
+            hex("00 00 00 00  02 00 00 00  03 00 00 00"),
+        ),
+        (ct::CT_REQUEST_EMBLEM, 9u64.to_le_bytes().to_vec()),
+        (ct::CT_QUERY_CHAR_NAME, hex("07 00 00 00")),
+        (ct::CT_UCC_COMPLEX_CHECK_VALID, 9u64.to_le_bytes().to_vec()),
+    ] {
+        let mut s = stream_client(&server, 900);
+        s.recv(&server, &frame(opcode, &body)).await.unwrap();
+        assert!(s.conn.is_closing(), "opcode {opcode:#x}");
+        assert!(s.drain().is_empty(), "opcode {opcode:#x}");
+    }
+}
+
+/// A join attempt with the owner's account but a wrong ticket (or the other way round) neither
+/// joins nor invalidates the real ticket.
+#[tokio::test]
+async fn a_foreign_join_leaves_the_owners_ticket_usable() {
+    let server = test_server();
+    let _g = game_connection(&server, 77);
+    let ticket = server.streams.add_token(1000, 77).expect("ticket");
+    let mut attacker = stream_client(&server, 901);
+    for (account, guess) in [(5, ticket), (1000, ticket ^ 1), (1000, 77)] {
+        attacker
+            .recv(&server, &join_frame(account, guess))
+            .await
+            .unwrap();
+        assert_eq!(attacker.drain(), vec![hex("01 00 01")]);
+        assert!(!attacker.conn.is_joined());
+    }
+    let mut owner = stream_client(&server, 902);
+    owner
+        .recv(&server, &join_frame(1000, ticket))
+        .await
+        .unwrap();
+    assert_eq!(owner.drain(), vec![hex("01 00 00")]);
+    assert_eq!(owner.conn.game_connection_id, Some(77));
+}
+
+/// A custom upload declaring more than the cap is refused before anything is queued.
+#[tokio::test]
+async fn an_oversize_custom_upload_is_refused() {
+    let (server, mut c, _g) = joined_printer(printer_3038()).await;
+    let p = server.world.character_by_connection(77).unwrap();
+    p.data().money = 50_000;
+    give_item(&server, &p, ITEM_CREST_BRAINSTORM, 1);
+    let start = start_upload_body(PRINTER_OBJ, crate::stream::models::MAX_UCC_UPLOAD_BYTES + 1);
+    c.recv(&server, &frame(ct::CT_START_UPLOAD_EMBLEM_STREAM, &start))
+        .await
+        .unwrap();
+    assert!(c.drain().is_empty());
+    assert_eq!(server.streams.ucc.queue_len(), 0);
+    assert_eq!(server.streams.ucc.parts_len(), 0);
+    // The cap itself is allowed.
+    let start = start_upload_body(PRINTER_OBJ, crate::stream::models::MAX_UCC_UPLOAD_BYTES);
+    c.recv(&server, &frame(ct::CT_START_UPLOAD_EMBLEM_STREAM, &start))
+        .await
+        .unwrap();
+    assert_eq!(c.drain(), vec![hex("0A 00  00 00 00 00 00")]);
+    assert_eq!(server.streams.ucc.parts_len(), 1);
+}
+
+/// A part that carries the upload past its declared size drops the upload and the connection.
+#[tokio::test]
+async fn a_part_beyond_the_declared_size_drops_the_upload() {
+    let (server, mut c, _g) = joined_printer(printer_3038()).await;
+    let p = server.world.character_by_connection(77).unwrap();
+    p.data().money = 50_000;
+    give_item(&server, &p, ITEM_CREST_BRAINSTORM, 1);
+    let start = start_upload_body(PRINTER_OBJ, 5);
+    c.recv(&server, &frame(ct::CT_START_UPLOAD_EMBLEM_STREAM, &start))
+        .await
+        .unwrap();
+    assert_eq!(c.drain(), vec![hex("0A 00  00 00 00 00 00")]);
+    assert_eq!(server.streams.ucc.parts_len(), 1);
+    let res = c
+        .recv(
+            &server,
+            &frame(
+                ct::CT_UPLOAD_EMBLEM_STREAM,
+                &hex("05 00 00 00  06 00 00 00  00 00 00 00  06 00  01 02 03 04 05 06"),
+            ),
+        )
+        .await;
+    assert!(res.is_err());
+    assert_eq!(server.streams.ucc.queue_len(), 0);
+    assert_eq!(server.streams.ucc.parts_len(), 0);
+}
+
+/// Pending upload / download state does not outlive the stream connection.
+#[tokio::test]
+async fn ucc_state_is_dropped_when_the_stream_connection_closes() {
+    use tokio::io::AsyncWriteExt;
+
+    let (server, _c, _g) = joined(Arc::new(TestWorld::default())).await;
+    server.streams.ucc.insert(custom_ucc(9, 10));
+    let server = Arc::new(server);
+    let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
+    let addr = listener.local_addr().unwrap();
+    let task = tokio::spawn(super::listener::serve_listener(server.clone(), listener));
+
+    let mut sock = tokio::net::TcpStream::connect(addr).await.unwrap();
+    let mut out = bytes(|s| {
+        s.write_u16(10)
+            .write_u16(ct::CT_JOIN)
+            .write_u32(1000)
+            .write_u32(77);
+    });
+    out.extend(bytes(|s| {
+        s.write_u16(10)
+            .write_u16(ct::CT_REQUEST_EMBLEM)
+            .write_u64(9);
+    }));
+    sock.write_all(&out).await.unwrap();
+    for _ in 0..100 {
+        if server.streams.ucc.download_queue_len() == 1 {
+            break;
+        }
+        tokio::time::sleep(Duration::from_millis(20)).await;
+    }
+    assert_eq!(server.streams.ucc.download_queue_len(), 1);
+
+    drop(sock);
+    for _ in 0..100 {
+        if server.streams.ucc.download_queue_len() == 0 {
+            break;
+        }
+        tokio::time::sleep(Duration::from_millis(20)).await;
+    }
+    assert_eq!(server.streams.ucc.download_queue_len(), 0);
+    task.abort();
+}
+
+/// The live cell requests of one connection are capped; the oldest makes room.
+#[tokio::test]
+async fn live_cell_requests_are_capped_per_connection() {
+    use crate::stream::connection::MAX_LIVE_CELL_REQUESTS;
+
+    let server = test_server();
+    let mut s = stream_client(&server, 900);
+    let first = s.conn.next_request_id(vec![doodad(1)]);
+    let mut last = first;
+    for _ in 0..(MAX_LIVE_CELL_REQUESTS * 3) {
+        last = s.conn.next_request_id(vec![doodad(1)]);
+    }
+    assert_eq!(s.conn.request_count(), MAX_LIVE_CELL_REQUESTS);
+    assert!(s.conn.request(first).is_none());
+    assert!(s.conn.request(last).is_some());
 }

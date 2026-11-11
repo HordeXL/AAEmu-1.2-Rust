@@ -106,8 +106,8 @@ pub fn tick(c: &mut AiCtx<'_>, k: BehaviorKind, delta_ms: i64) {
         B::Despawning | B::DoNothing | B::Dummy => {}
         B::FollowPath => follow_path_tick(c, k, delta_ms),
         B::FollowUnit => follow_unit_tick(c, k, delta_ms),
-        B::HoldPosition => hold_position_tick(c, k),
-        B::Idle => idle_tick(c, k),
+        B::HoldPosition => hold_position_tick(c, k, delta_ms),
+        B::Idle => idle_tick(c, k, delta_ms),
         B::ReturnState => return_state_tick(c, k, delta_ms),
         B::Roaming => roaming_tick(c, k, delta_ms),
         B::RunCommandSet => run_command_set_tick(c, delta_ms),
@@ -606,15 +606,26 @@ fn report_npc_without_ai(obj_id: u32) -> bool {
 
 /// `Behavior.UpdateAggroHelp(abuser, radius)`.
 pub fn update_aggro_help(c: &mut AiCtx<'_>, abuser: &WorldObject, radius: f32) {
+    // `npc_groups.aggro_rule_id == 2` mirrors the aggro table; rule 1 members answer the help
+    // call through the group-link path below (10.x `NpcAggroTable::CollectSharedAggroMembers`
+    // and the link-help group-instance relation bypass).
+    super::group::share_aggro_with_group(c, abuser);
     let t = template_scalars(c);
-    let my_template_id = c.npc.data().unit.template_id;
+    let (my_template_id, my_group_instance, my_group_rule, my_faction) = {
+        let d = c.npc.data();
+        (
+            d.unit.template_id,
+            d.npc_group_instance,
+            d.npc_group_aggro_rule_id,
+            d.unit.faction_id,
+        )
+    };
     let link_data = &c.server.game_data.systems.npcs.npc.aggro_links;
     let npcs: Vec<WorldObject> =
         npc::around(c.server, &c.obj, t.attack_start_range_scale * radius, false)
             .into_iter()
             .filter(|o| o.as_npc().is_some())
             .collect();
-    let my_faction = c.npc.data().unit.faction_id;
     for other in npcs {
         let Some(other_npc) = other.as_npc().cloned() else {
             continue;
@@ -622,10 +633,21 @@ pub fn update_aggro_help(c: &mut AiCtx<'_>, abuser: &WorldObject, radius: f32) {
         let Some(ot) = npc::template(c.server, &other_npc) else {
             continue;
         };
-        let (in_battle, faction) = {
+        let (in_battle, faction, other_group_instance) = {
             let d = other_npc.data();
-            (d.unit.is_in_battle, d.unit.faction_id)
+            (d.unit.is_in_battle, d.unit.faction_id, d.npc_group_instance)
         };
+        // 10.x link help with `npc_groups.aggro_rule_id == 1` (Z:823640-823646 /
+        // 823849-823851): a candidate of the same spawned batch is accepted even when its own
+        // template relation test fails, so the group mates answer the help call together. The
+        // scan still requires the candidate's `accept_aggro_link` (Z:823774), so a template that
+        // declines aggro links keeps declining (43 of the 376 rule-1 member rows). The batch's
+        // rule 2 members are already on the table (mirrored above); rule 0 neither mirrors nor
+        // answers by group.
+        let group_link = my_group_instance != 0
+            && my_group_rule == 1
+            && other_group_instance == my_group_instance
+            && ot.accept_aggro_link;
         // 1.2 data: the members of an `aggro_links` group help each other even when their own
         // template (`accept_aggro_link`, `aggression` / `aggro_link_special_rule_id`) would
         // decline. No consumer was found in the 10.x decompile, so this rule is data-inferred
@@ -634,14 +656,32 @@ pub fn update_aggro_help(c: &mut AiCtx<'_>, abuser: &WorldObject, radius: f32) {
         if in_battle || (!ot.accept_aggro_link && !same_group) {
             continue;
         }
-        if npc::distance_to(c.server, &other, &c.obj, false) > ot.aggro_link_help_dist {
+        // Rule-1 batch mates answer out to their own aggression radius as a fallback: the 1.2
+        // `aggro_link_help_dist` is 6 m for 91 of the 101 rule-1 groups (376 member rows:
+        // median 6, max 50, none 0), too short once the batch spreads beyond its 2-3 m
+        // formation offsets. The 10.x link-help scan collects candidates within 50 m
+        // (`sub_39325250(..., 50.0, ...)`, Z:823753) and then applies the per-template
+        // distance, so a group-link mate uses `max(aggro_link_help_dist,
+        // attack_start_range_scale * 10)` (the `check_aggression` scan radius).
+        let help_dist = if group_link {
+            ot.aggro_link_help_dist
+                .max(ot.attack_start_range_scale * 10.0)
+        } else {
+            ot.aggro_link_help_dist
+        };
+        if npc::distance_to(c.server, &other, &c.obj, false) > help_dist {
             continue;
         }
         // The template path is the C# `UpdateAggroHelp` (Behavior.cs, `a2ab80abd^`): the
         // special-rule branch requires `aggro_link_sight_check` to be enabled AND the abuser
         // visible; a template with sight check off never helps through rules 1..4.
         let template_helps = if ot.aggression && ot.aggro_link_special_rule_id == 0 {
-            true
+            // Deviation from the C# (which helped unconditionally here): a helper of another
+            // faction joins only a fight it could start itself. The system-neutral Gossiper
+            // Banshees (faction 2) of the Requiem Cape fort stood among faction-115 Bloodhands,
+            // took their attackers into the aggro table, could not attack them and stayed in
+            // combat until the player relogged. Same-faction packs still help each other.
+            faction == my_faction || can_attack(c.server, &other, abuser)
         } else {
             if !(ot.aggro_link_sight_check && npc::can_see_target(c.server, &other, abuser)) {
                 false
@@ -666,7 +706,12 @@ pub fn update_aggro_help(c: &mut AiCtx<'_>, abuser: &WorldObject, radius: f32) {
         // Link path (AGGROLINK-1): the sight check applies only when the helper enables it.
         let link_helps = same_group
             && (!ot.aggro_link_sight_check || npc::can_see_target(c.server, &other, abuser));
-        if !template_helps && !link_helps {
+        // Rule-1 group mates that accept aggro links answer the help call (the relation test
+        // above is bypassed); the helper's own sight check still applies, as in the 10.x
+        // candidate scan.
+        let group_link_helps = group_link
+            && (!ot.aggro_link_sight_check || npc::can_see_target(c.server, &other, abuser));
+        if !template_helps && !link_helps && !group_link_helps {
             continue;
         }
         // npc.Ai.Owner.AddUnitAggro(...) + npc.Ai.OnAggroTargetChanged(): an NPC without an
@@ -688,7 +733,7 @@ pub fn update_aggro_help(c: &mut AiCtx<'_>, abuser: &WorldObject, radius: f32) {
             .aggro_table
             .contains_key(&abuser.obj_id());
         add_unit_aggro(c.server, &other, AggroKind::Damage, abuser, 1);
-        if link_helps && !template_helps && !was_engaged {
+        if (link_helps || group_link_helps) && !template_helps && !was_engaged {
             let engaged = other_npc
                 .data()
                 .unit
@@ -700,6 +745,7 @@ pub fn update_aggro_help(c: &mut AiCtx<'_>, abuser: &WorldObject, radius: f32) {
                     helper = other_npc.obj_id,
                     leader = c.npc.obj_id,
                     abuser = abuser.obj_id(),
+                    group_link = group_link_helps,
                     "aggro link: group member joined the fight"
                 );
             }
@@ -787,32 +833,35 @@ fn can_use_skill(c: &mut AiCtx<'_>, k: BehaviorKind) -> bool {
 }
 
 /// `BaseCombatBehavior.ShouldReturn`.
+///
+/// Deviation: the C# returned only while the NPC was within `absolute_return_distance` of its
+/// idle position ("if it's greater, then we need a teleport to the spawn point", never written),
+/// so a mob pulled past it never returned and could be dragged anywhere (the Sealstone Guardian
+/// 8945 has return 50 m = absolute 50 m: no leash at all). Past `return_distance` it now always
+/// returns; [`return_state_enter`] teleports it home when it is past the absolute distance.
 fn should_return(c: &AiCtx<'_>) -> bool {
     // Never trigger return while a SkillController is actively driving the NPC.
     if npc::skill_controller_running(&c.obj) {
         return false;
     }
-    let t = template_scalars(c);
-    let mut return_distance = 50.0f32;
-    let mut absolute_return_distance = 200.0f32;
-    if t.return_distance > 0.0 {
-        return_distance = t.return_distance;
-    }
-    if t.absolute_return_distance > 0.0 {
-        absolute_return_distance = t.absolute_return_distance;
-    }
+    let (return_distance, _) = return_distances(c);
     let Some(target) = current_target(c) else {
         return true; // no target, returning
     };
     let me = owner_pos(c);
     let distance_to_target = calculate_distance(me, npc::world_pos(c.server, &target), true);
     let distance_to_idle = calculate_distance(me, c.ai.idle_position, true);
-    let mut res = distance_to_target > return_distance || distance_to_idle > return_distance;
-    if res {
-        // if it's greater, then we need a teleport to the spawn point
-        res = distance_to_idle <= absolute_return_distance;
-    }
-    res
+    distance_to_target > return_distance || distance_to_idle > return_distance
+}
+
+/// The template's `(return_distance, absolute_return_distance)`, defaulting to 50 m / 200 m.
+fn return_distances(c: &AiCtx<'_>) -> (f32, f32) {
+    let t = template_scalars(c);
+    let positive_or = |v: f32, default: f32| if v > 0.0 { v } else { default };
+    (
+        positive_or(t.return_distance, 50.0),
+        positive_or(t.absolute_return_distance, 200.0),
+    )
 }
 
 fn geo_data_mode(c: &AiCtx<'_>) -> bool {
@@ -1710,7 +1759,7 @@ fn hold_position_enter(c: &mut AiCtx<'_>, k: BehaviorKind) {
     s.initialized = true;
 }
 
-fn hold_position_tick(c: &mut AiCtx<'_>, k: BehaviorKind) {
+fn hold_position_tick(c: &mut AiCtx<'_>, k: BehaviorKind, delta_ms: i64) {
     if !c.st(k).initialized {
         tracing::warn!(
             "HoldPositionBehavior.Tick called before initialization for unit {}",
@@ -1730,7 +1779,11 @@ fn hold_position_tick(c: &mut AiCtx<'_>, k: BehaviorKind) {
         c.st(k).following_npc = false;
         return;
     }
-    // 2. Try to use idle self-skills (1 s between tries)
+    // 2. A group follower's `formation_GoToOnPoint` movement replaces the hold-position walk;
+    // its idle activity (self-skills, follow-default, talk) still runs below (1.2
+    // `hold_position.UpdateHoldPosition`).
+    super::group::follower_tick(c, delta_ms);
+    // 3. Try to use idle self-skills (1 s between tries)
     let now = now_ms();
     if now - c.st(k).last_skill_check >= 1000 {
         c.st(k).last_skill_check = now;
@@ -1740,11 +1793,11 @@ fn hold_position_tick(c: &mut AiCtx<'_>, k: BehaviorKind) {
             pick_skill_and_use_it(c, k, SkillUseConditionKind::InIdle, &me, dist);
         }
     }
-    // 3. Optional follow default NPC
+    // 4. Optional follow default NPC
     if !c.st(k).following_npc && c.do_follow_default_nearest_npc() {
         c.st(k).following_npc = true;
     }
-    // 4. Talk has low priority
+    // 5. Talk has low priority
     check_for_talk(c, k);
 }
 
@@ -1767,7 +1820,7 @@ fn idle_enter(c: &mut AiCtx<'_>, k: BehaviorKind) {
     c.st(k).initialized = true;
 }
 
-fn idle_tick(c: &mut AiCtx<'_>, k: BehaviorKind) {
+fn idle_tick(c: &mut AiCtx<'_>, k: BehaviorKind, delta_ms: i64) {
     if !c.st(k).initialized {
         tracing::warn!(
             "IdleBehavior.Tick called before initialization for unit {}",
@@ -1792,6 +1845,9 @@ fn idle_tick(c: &mut AiCtx<'_>, k: BehaviorKind) {
     } else if check_follow_path(c) {
         c.go_to_follow_path();
     } else {
+        // A group follower's movement is the formation follow (1.2 `idle.UpdateIdle`); its idle
+        // activity still runs.
+        super::group::follower_tick(c, delta_ms);
         // Try to follow the nearest NPC, otherwise go to default behavior
         if c.do_follow_default_nearest_npc() {
             return;
@@ -1803,6 +1859,12 @@ fn idle_tick(c: &mut AiCtx<'_>, k: BehaviorKind) {
 }
 
 fn return_state_enter(c: &mut AiCtx<'_>, k: BehaviorKind) {
+    // Ending a fight (the abuser died, left or was cleared) must let a later fight against the
+    // same object share with the group again.
+    c.npc.data().npc_group_last_share_abuser = 0;
+    // A group follower returns to its formation point, not its own spawn (1.2
+    // `idle` / `hold_position` re-anchor a member's idle position on the leader).
+    super::group::sync_return_to_formation(c);
     if !c.npc.data().unit.skill_state.aggro_table.is_empty() {
         combat::npc_clear_all_aggro(c);
     }
@@ -1843,10 +1905,16 @@ fn return_state_enter(c: &mut AiCtx<'_>, k: BehaviorKind) {
             },
         );
     }
-    if c.ai
-        .param
-        .as_ref()
-        .is_some_and(|p| p.always_teleport_on_return)
+    // Past `absolute_return_distance` the NPC is teleported to its idle position (the C#
+    // `ShouldReturn` note "we need a teleport to the spawn point"; see `should_return`).
+    let (_, absolute_return_distance) = return_distances(c);
+    let beyond_absolute =
+        calculate_distance(owner_pos(c), c.ai.idle_position, true) > absolute_return_distance;
+    if beyond_absolute
+        || c.ai
+            .param
+            .as_ref()
+            .is_some_and(|p| p.always_teleport_on_return)
     {
         on_completed_return(c);
         return;
@@ -1887,6 +1955,9 @@ fn return_state_tick(c: &mut AiCtx<'_>, k: BehaviorKind, delta_ms: i64) {
     if !c.st(k).enter {
         return;
     }
+    // The leader may have moved since the fight ended: recompute the formation point from its
+    // current position every tick instead of freezing the spot chosen at ReturnState entry.
+    super::group::sync_return_to_formation(c);
     let mut move_speed = npc::real_movement_speed(&c.obj, f64::from(base_move_speed(c)));
     let move_flags = npc::real_movement_flags(move_speed);
     move_speed *= delta_seconds(delta_ms);
@@ -1949,6 +2020,16 @@ fn roaming_tick(c: &mut AiCtx<'_>, k: BehaviorKind, delta_ms: i64) {
     }
     if !check_aggression(c, k) {
         check_alert(c, k);
+    }
+    // A group follower that already left Roaming (combat / alert) must not move here; ordinary
+    // NPCs keep the original control flow (no early return outside the feature).
+    if crate::systems::npcs::npc::group::is_follower(&c.npc) && c.ai.current_behavior() != Some(k) {
+        return;
+    }
+    // A group follower never roams on its own: it follows its move leader's formation point
+    // (1.2 `roaming.UpdateRoaming`).
+    if super::group::follower_tick(c, delta_ms) {
+        return;
     }
     let zero = |v: Vec3| v.x == 0.0 && v.y == 0.0 && v.z == 0.0;
     if zero(c.st(k).roam_target) && now_ms() > c.st(k).next_roaming {
@@ -3443,6 +3524,112 @@ mod tests {
         assert!(
             table.contains_key(&player_b.obj_id),
             "the helper must help its group 501 member"
+        );
+    }
+
+    /// Rule 0 (aggressive, no special rule) help needs a reason to fight: the helper shares the
+    /// attacked NPC's faction or can attack the abuser itself. A system-neutral (faction 2)
+    /// Gossiper Banshee next to a hostile faction-115 mob must not take the mob's attacker into
+    /// its aggro table (it cannot attack a player, so it stayed in combat); a faction-115 helper
+    /// still joins, and the banshee still helps a neutral NPC of its own faction.
+    #[tokio::test]
+    async fn rule_zero_help_needs_the_same_faction_or_a_hostile_abuser() {
+        use super::super::framework::{AiKind, NpcAi};
+        use crate::data::world_data::{FactionRelation, SystemFaction};
+        use crate::data::GameData;
+        use crate::models::npc::Npc;
+        use crate::systems::skills::types::RelationState;
+        use crate::test_support::{spawn_player, test_character, test_server_with, TestClient};
+        use crate::world::Entity;
+
+        const LEADER: u32 = 0x360;
+        const BANSHEE: u32 = 0x361;
+        const KOBOLD: u32 = 0x362;
+        const NEUTRAL_LEADER: u32 = 0x363;
+        const ABUSER: u32 = 0x364;
+
+        let mut data = GameData::empty();
+        for (id, mother_id) in [(2, 0), (109, 149), (115, 0), (149, 0)] {
+            data.factions.add(SystemFaction {
+                id,
+                mother_id,
+                ..SystemFaction::default()
+            });
+        }
+        data.factions.relations.push(FactionRelation {
+            id: 149,
+            id2: 115,
+            state: RelationState::Hostile as u8,
+            exp_time: 0,
+        });
+        for id in [7400, 7401, 7402] {
+            data.systems
+                .npcs
+                .npc
+                .templates
+                .insert(id, link_only_template(id, true, true, 30.0));
+        }
+        let server = Arc::new(test_server_with(data));
+        server.set_self();
+        crate::systems::skills::bind(&server);
+        let client = TestClient::new(&server, 1, 1001);
+        let player = spawn_player(
+            &server,
+            &client,
+            test_character(1, "Tank", 98.0, 100.0),
+            ABUSER,
+        );
+        player.data().unit.faction_id = 109;
+
+        let spawn_leader = |obj_id: u32, faction: u32| {
+            let mut leader = Npc::new(7400);
+            leader.unit.transform.set_xyz(100.0, 100.0, 100.0);
+            leader.unit.faction_id = faction;
+            let leader = Entity::new(obj_id, leader);
+            server
+                .world
+                .world(0)
+                .unwrap()
+                .spawn(&leader, &server.view_ctx());
+            leader
+        };
+        let leader = spawn_leader(LEADER, 115);
+        let banshee = spawn_link_npc(&server, BANSHEE, 7401, 105.0);
+        banshee.data().unit.faction_id = 2;
+        let kobold = spawn_link_npc(&server, KOBOLD, 7402, 110.0);
+        kobold.data().unit.faction_id = 115;
+
+        let abuser = WorldObject::from(&player);
+        let help = |leader: &crate::world::NpcRef| {
+            let mut ai = NpcAi::new(AiKind::AlmightyNpc, leader);
+            let mut context = AiCtx {
+                server: &server,
+                npc: leader.clone(),
+                obj: WorldObject::from(leader),
+                ai: &mut ai,
+            };
+            update_aggro_help(&mut context, &abuser, 200.0);
+        };
+        let has_aggro = |npc: &crate::world::NpcRef| {
+            npc.data()
+                .unit
+                .skill_state
+                .aggro_table
+                .contains_key(&player.obj_id)
+        };
+
+        help(&leader);
+        assert!(
+            !has_aggro(&banshee),
+            "a neutral helper of another faction must not join a fight it cannot start"
+        );
+        assert!(has_aggro(&kobold), "a same-faction helper still joins");
+
+        let neutral_leader = spawn_leader(NEUTRAL_LEADER, 2);
+        help(&neutral_leader);
+        assert!(
+            has_aggro(&banshee),
+            "a neutral helper still helps a neutral NPC of its own faction"
         );
     }
 

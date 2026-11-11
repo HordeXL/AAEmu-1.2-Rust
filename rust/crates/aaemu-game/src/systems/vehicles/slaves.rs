@@ -2241,15 +2241,17 @@ fn try_delete(
     // state reaches its client. It kept its world pose above; tell its own client where that
     // is, as every other server-forced move does (portal, recall, GM teleport).
     for (player, t) in deck_standers {
-        player.data().set_disabled_set_position(true);
-        player.send(SCTeleportUnitPacket {
-            reason: TELEPORT_REASON_MOVE_TO_LOCATION,
-            error_message: 0,
-            x: t.x,
-            y: t.y,
-            z: t.z,
-            z2: t.rot_z,
-        });
+        crate::world::session::send_teleport_unit(
+            &player,
+            SCTeleportUnitPacket {
+                reason: TELEPORT_REASON_MOVE_TO_LOCATION,
+                error_message: 0,
+                x: t.x,
+                y: t.y,
+                z: t.z,
+                z2: t.rot_z,
+            },
+        );
     }
     if let Some(s) = &spawns {
         s.add_despawn(
@@ -4923,9 +4925,10 @@ pub fn do_hp_change_trigger(server: &GameServer, slave: &SlaveRef, trigger_value
 
 /// KILL_SLAVE (kind 26, `value1` 2 = the siege catapult, `value2` 1 = the opposing side,
 /// INFERRED): destroying an enemy-side siege catapult during an active siege credits its
-/// killer. The authored achievement text asks for the opposing siege camp, so both characters
-/// must be on the roster and on different sides; a catapult outside a siege or killed by its
-/// own side credits nothing.
+/// killer. The authored achievement text asks for the opposing siege camp, so the catapult's
+/// owner must be on the roster and the killer not on the owner's side (a killer off the roster
+/// is credited); a catapult outside a siege, one whose owner is off the roster or one killed by
+/// its own side credits nothing.
 fn credit_siege_catapult_kill(server: &GameServer, slave: &SlaveRef, killer: Option<&WorldObject>) {
     const SIEGE_CATAPULT: u32 = 2;
     let (template_id, owner_id, zone_id) = {

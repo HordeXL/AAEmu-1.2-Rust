@@ -766,6 +766,64 @@ async fn event_controller_keeps_its_wave_plot_while_the_ai_settles() {
     );
 }
 
+/// The Sealstone Guardian (8945: return 50 m = absolute return 50 m) could be dragged anywhere:
+/// the C# `ShouldReturn` returned only within the absolute distance. Pulled 80 m from home with
+/// its attacker right next to it, the NPC now gives up and is teleported home.
+#[tokio::test]
+async fn npc_pulled_past_the_absolute_return_distance_goes_home() {
+    let mut d = data();
+    let t = d
+        .systems
+        .npcs
+        .npc
+        .templates
+        .get_mut(&NPC_TEMPLATE)
+        .expect("npc template");
+    t.return_distance = 50.0;
+    t.absolute_return_distance = 50.0;
+    let server = server_with_data(d);
+    let client = TestClient::new(&server, 1, 1);
+    let mut c = test_character(1, "Kiter", 115.0, 100.0);
+    c.unit.hp = 1000;
+    c.unit.max_hp = 1000;
+    let player = spawn_player(&server, &client, c, PLAYER_OBJ);
+    let npc = spawn_npc(
+        &server,
+        NPC_OBJ,
+        NPC_TEMPLATE,
+        100.0,
+        100.0,
+        AiKind::HoldPosition,
+    );
+    let attacked = tick_until(&server, 100, 20, 50, || {
+        behavior(&server, NPC_OBJ) == Some(B::Attack)
+    })
+    .await;
+    assert!(
+        attacked,
+        "npc never attacked: {:?}",
+        behavior(&server, NPC_OBJ)
+    );
+
+    // Dragged 80 m from home; the attacker stays 3 m away (inside its return distance).
+    npc.data().unit.transform.set_xyz(180.0, 100.0, 100.0);
+    let world = server.world.world(0).expect("world");
+    world.add_visible_object(&npc, &server.view_ctx());
+    move_player(&server, &player, 183.0, 100.0);
+    let home = tick_until(&server, 100, 20, 40, || {
+        let p = npc_pos(&npc);
+        (p.x - 100.0).abs() < 1.5 && behavior(&server, NPC_OBJ) != Some(B::Attack)
+    })
+    .await;
+    assert!(
+        home,
+        "npc stayed at {:?} in {:?}",
+        npc_pos(&npc),
+        behavior(&server, NPC_OBJ)
+    );
+    assert!(npc.data().unit.skill_state.aggro_table.is_empty());
+}
+
 #[tokio::test]
 async fn return_state_teleports_home_after_the_timeout() {
     let server = server();
@@ -3560,4 +3618,68 @@ async fn pull_aggro_disabled_switches_at_101_percent() {
     add_threat(&f, &f.player_c, 101);
     tick_all(&f.server, 100);
     assert_eq!(f.npc.data().unit.current_target, TAUNTER2_OBJ);
+}
+
+/// A faction guard aggroes a hostile pirate in range, as in the permanently safe home zones. The
+/// relation comes from `system_faction_relations` (161 pirate / 167 Nuia guard, both hostile),
+/// so the same `can_attack` gate the AI uses accepts the pair. The fixture sets no zone faction
+/// and no conflict cycle: it covers the relation path only, not a zone's own protection rules.
+#[tokio::test]
+async fn a_guard_aggroes_a_hostile_pirate() {
+    use crate::data::world_data::{FactionRelation, SystemFaction};
+    use crate::systems::skills::geometry::Target;
+
+    let mut d = data();
+    for (id, mother) in [(114, 0), (161, 114), (167, 0)] {
+        d.factions.add(SystemFaction {
+            id,
+            mother_id: mother,
+            ..Default::default()
+        });
+    }
+    // The live 1.2 rows that make a Nuia guard hostile to pirates: the guard faction against
+    // the outlaw root (161's mother) and against 161 itself.
+    for (id, id2) in [(114, 167), (161, 167)] {
+        d.factions.relations.push(FactionRelation {
+            id,
+            id2,
+            state: 1, // RelationState::Hostile
+            exp_time: 0,
+        });
+    }
+    let server = server_with_data(d);
+    let client = TestClient::new(&server, 1, 1);
+    let mut c = test_character(1, "Pirate", 105.0, 100.0);
+    c.unit.faction_id = 161;
+    c.unit.hp = 1000;
+    c.unit.max_hp = 1000;
+    let pirate = spawn_player(&server, &client, c, PLAYER_OBJ);
+    let guard = spawn_npc(
+        &server,
+        NPC_OBJ,
+        NPC_TEMPLATE,
+        100.0,
+        100.0,
+        AiKind::HoldPosition,
+    );
+    guard.data().unit.faction_id = 167;
+    guard.data().unit.transform.rot_z = FACE_PLUS_X;
+    assert!(
+        crate::systems::skills::relation::can_attack(
+            &server,
+            &Target::Obj(WorldObject::from(&guard)),
+            &Target::Obj(WorldObject::from(&pirate)),
+        ),
+        "the guard's faction is hostile to the pirate"
+    );
+    assert!(
+        aggros(&server, 60).await,
+        "the guard never aggroed the pirate"
+    );
+    assert!(guard
+        .data()
+        .unit
+        .skill_state
+        .aggro_table
+        .contains_key(&PLAYER_OBJ));
 }

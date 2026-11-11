@@ -1914,6 +1914,45 @@ fn db_sphere(
     }
 }
 
+/// The `AreaSphere` requirement (skill 15204, quest 2273 "March of Respect"): sphere 1152 links
+/// to quest 2907 (`sphere_quests` 660), which has no client sign sphere at Prince Reander's
+/// Monument, so only the sphere's own `sphere_area_fill.json` area can pass it. A position
+/// outside the area, and a sphere that is not a `SphereQuest`, still fail.
+#[test]
+fn requirement_sphere_falls_back_to_the_shipped_area() {
+    use super::data::DbSphereQuest;
+    use super::spheres::SphereQuestManager;
+
+    let mut d = QuestData::default();
+    d.spheres
+        .insert(1152, db_sphere(1152, "SphereQuest", 660, true, ""));
+    d.spheres
+        .insert(9001, db_sphere(9001, "SphereTeleport", 1, true, ""));
+    d.sphere_quests.insert(
+        660,
+        DbSphereQuest {
+            id: 660,
+            quest_id: 2907,
+            quest_trigger_id: 1,
+        },
+    );
+    d.finish();
+    let spheres = SphereQuestManager::default();
+    spheres.set_areas(vec![
+        area_sphere(1152, 22214.95, 13107.97, 248.995, 6.0),
+        area_sphere(9001, 100.0, 100.0, 100.0, 6.0),
+    ]);
+
+    let altar = (22215.4, 13107.1, 251.0);
+    assert!(spheres
+        .is_inside_area_sphere(&d, 1152, 1, altar, 0)
+        .is_none());
+    assert!(spheres.inside_requirement_sphere(&d, 1152, 1, altar));
+    assert!(!spheres.inside_requirement_sphere(&d, 1152, 1, (22230.0, 13107.1, 251.0)));
+    assert!(!spheres.inside_requirement_sphere(&d, 9001, 1, (100.0, 100.0, 100.0)));
+    assert!(!spheres.inside_requirement_sphere(&d, 7777, 1, altar));
+}
+
 fn area_server(
     spheres: Vec<DbSphere>,
     areas: Vec<SphereArea>,
@@ -6623,4 +6662,90 @@ async fn supply_jury_point_sends_the_changed_packet() {
             .any(|(op, body)| *op == sc::SCJuryPointChangedPacket && *body == expected),
         "jury point change packet: {frames:x?}"
     );
+}
+
+#[tokio::test]
+async fn client_quest_requests_name_an_npc_within_reach() {
+    let (server, _) = server_with(|d| {
+        d.add_template(quest(60));
+        d.add_component(component(601, 60, kind::START));
+        d.add_act(601, 601, 601, 0, ActKind::ConAcceptNpc { npc_id: 500 });
+        d.add_component(component(602, 60, kind::READY));
+        d.add_act(
+            602,
+            602,
+            602,
+            0,
+            ActKind::ConReportNpc {
+                npc_id: 500,
+                use_alias: false,
+                alias_id: 0,
+            },
+        );
+        // Quest 61: auto-started, turned in at NPC 501.
+        d.add_template(quest(61));
+        d.add_component(component(611, 61, kind::START));
+        d.add_act(611, 611, 611, 0, ActKind::ConAutoComplete);
+        d.add_component(component(612, 61, kind::READY));
+        d.add_act(
+            612,
+            612,
+            612,
+            0,
+            ActKind::ConReportNpc {
+                npc_id: 501,
+                use_alias: false,
+                alias_id: 0,
+            },
+        );
+    });
+    let mut client = TestClient::new(&server, 1, 1001);
+    let player = spawn_player(&server, &client, character(), 0x100);
+    client.conn.active_char = Some(player.clone());
+    let world = server.world.world(0).unwrap();
+    // The player stands at (100, 100): obj 0x210 is 150 m away, 0x211 about 7 m.
+    for (obj, template, x) in [
+        (0x210u32, 500u32, 250.0f32),
+        (0x211, 500, 105.0),
+        (0x212, 501, 250.0),
+        (0x213, 501, 105.0),
+    ] {
+        let mut n = crate::models::npc::Npc::new(template);
+        n.unit.transform.set_xyz(x, 105.0, 100.0);
+        world.spawn(Entity::new(obj, n), &server.view_ctx());
+    }
+    events::add_quest(&server, &player, 61, false);
+    server.systems.quests.run_queued_evaluations(&server);
+    client.drain();
+
+    // Start: the far NPC is refused, the near one (within reach + dialog slack) accepted.
+    events::start_quest_context(&server, &player, 60, 0x210, 0, 0);
+    server.systems.quests.run_queued_evaluations(&server);
+    assert!(!events::has_quest(&player, 60));
+    events::start_quest_context(&server, &player, 60, 0x211, 0, 0);
+    server.systems.quests.run_queued_evaluations(&server);
+    assert!(events::has_quest(&player, 60));
+
+    // Report: the far NPC answers INVALID_NPC_OR_QUEST without reaching the quest.
+    client.drain();
+    events::on_report(&server, &player, 61, 0x212, 0, 0);
+    assert_one_failed(
+        &mut client,
+        61,
+        super::packets::quest_error::INVALID_NPC_OR_QUEST,
+    );
+    assert!(events::has_quest(&player, 61));
+    events::on_report(&server, &player, 61, 0x213, 0, 0);
+    server.systems.quests.run_queued_evaluations(&server);
+    assert!(
+        !events::has_quest(&player, 61),
+        "the near NPC completes the report"
+    );
+
+    // The config switch turns the check off.
+    server
+        .config
+        .update(|c| c.interaction.npc_reach_check = false);
+    events::start_quest_context(&server, &player, 60, 0x210, 0, 0);
+    // (already active: nothing to assert beyond no panic)
 }
