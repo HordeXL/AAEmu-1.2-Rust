@@ -612,6 +612,14 @@ impl ServerProfile {
         !matches!(self, Self::EuLaunch)
     }
 
+    /// The C# dungeon entry cap (`IndunManager.CheckEntryAttemptCount`: 3 entries per 4 hours).
+    /// The owner's EU 1.2 recollection (2026-11-10) is that 1.2 had no entry limit (the
+    /// "5 per dungeon" cap came later), so `EuAuroria` leaves it off; the other profiles keep
+    /// the C# default. `Dungeons.EntryLimit.Enabled` overrides this when set.
+    pub fn dungeon_entry_limit(self) -> bool {
+        !matches!(self, Self::EuAuroria)
+    }
+
     /// The Archeum Lodestone max HP of the era, over the `r208022` `housings.hp` value
     /// (1,000,000); `None` keeps the template value.
     ///
@@ -1724,6 +1732,33 @@ mod tests {
         assert_eq!(cfg.login_network.port, 1234);
         assert!(cfg.account.delete_release_name);
         assert_eq!(cfg.account.access_level_first_account, 100);
+    }
+
+    /// Test accounts receive their starting Credits/Loyalty when the game creates their account
+    /// row on first login. The defaults stay 0, so a normal server is unaffected.
+    #[test]
+    fn test_server_starting_credits_and_loyalty_bind() {
+        assert_eq!(AppConfig::default().credits.default, 0);
+        assert_eq!(AppConfig::default().loyalty.default, 0);
+        let cfg = AppConfig::from_value(json!({
+            "Credits": { "Default": 1_000_000 },
+            "Loyalty": { "Default": "5000" }
+        }))
+        .unwrap();
+        assert_eq!(cfg.credits.default, 1_000_000);
+        assert_eq!(cfg.loyalty.default, 5_000);
+    }
+
+    /// The shipped example file binds to the values the wiki page documents (a typo in the file
+    /// would otherwise only show up on a test server).
+    #[test]
+    fn the_shipped_test_server_example_binds_to_its_documented_values() {
+        let value: serde_json::Value =
+            serde_json::from_str(include_str!("../app/ExampleConfig.TestServer.json"))
+                .expect("the example is valid JSON");
+        let cfg = AppConfig::from_value(value).unwrap();
+        assert_eq!(cfg.credits.default, 1_000_000);
+        assert_eq!(cfg.loyalty.default, 5_000);
     }
 
     #[test]

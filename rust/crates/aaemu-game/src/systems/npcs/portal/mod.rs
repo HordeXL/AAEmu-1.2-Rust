@@ -262,6 +262,18 @@ fn player_world_position(server: &GameServer, p: &PlayerRef) -> (f32, f32, f32) 
 /// faction (district-specific respawns) in an open zone (non-GMs); the current position as a
 /// fail-safe.
 pub fn closest_return_portal(server: &GameServer, player: &PlayerRef) -> Portal {
+    closest_return_portal_matching(server, player, |_| true)
+}
+
+/// [`closest_return_portal`] restricted to the respawn points `accept` allows (a caller that
+/// must not send the character to some of them, e.g. a spot inside a siege area, asks for the
+/// closest allowed one instead of giving up on the closest). The same fail-safe applies: when
+/// no point qualifies the result is the character's current position with `id` 0.
+pub fn closest_return_portal_matching(
+    server: &GameServer,
+    player: &PlayerRef,
+    accept: impl Fn(&Portal) -> bool,
+) -> Portal {
     let (x, y, z) = player_world_position(server, player);
     let (zone_id, faction_id, access_level) = {
         let c = player.data();
@@ -299,6 +311,9 @@ pub fn closest_return_portal(server: &GameServer, player: &PlayerRef) -> Portal 
                 Some(zone) if zone.closed => continue,
                 Some(_) => {}
             }
+        }
+        if !accept(value) {
+            continue;
         }
         let dist = distance_2d(x, y, value.x, value.y);
         if dist >= distance {
@@ -988,7 +1003,8 @@ pub fn use_portal_with_preference(
     } else {
         player.data().set_disabled_set_position(true);
     }
-    crate::world::session::send_teleport_unit(
+    crate::world::session::send_teleport_unit_ending_trade(
+        server,
         player,
         SCTeleportUnitPacket {
             reason: packets::teleport_reason::PORTAL,
@@ -1004,7 +1020,16 @@ pub fn use_portal_with_preference(
 /// `WorldManager.ResendVisibleObjectsToCharacter(character)`: every object of the neighbouring
 /// regions is shown again (`AddVisibleObject(character)`); doodads are batched into
 /// `SCDoodadsCreatedPacket`s.
+///
+/// Every caller is a client world wipe (cut-scene end, teleport ended, in-place zone load), which
+/// also drops the far quest-map markers; this repaint covers only the neighbourhood, so the
+/// quest-map range option is told to stream its markers again.
 pub fn resend_visible_objects_to_character(server: &GameServer, player: &PlayerRef) {
+    server
+        .systems
+        .quests
+        .quest_map
+        .client_world_reset(player.character_id);
     let instance_id = player.data().unit.transform.instance_id;
     let Some(world) = server.world.world(instance_id) else {
         return;
@@ -1151,7 +1176,7 @@ pub fn navi_teleport(server: &GameServer, player: &PlayerRef, obj_id: u32) {
         return;
     }
     run_navi_func(server, &doodad, player, &func);
-    session::begin_teleport(player, pos.x, pos.y, pos.z);
+    session::begin_teleport_ending_trade(server, player, pos.x, pos.y, pos.z);
     player.send(packets::SCNaviTeleportPacket {
         x: pos.x,
         y: pos.y,
@@ -1264,7 +1289,8 @@ pub fn use_teleport(
             return; // NotEnoughMoney is sent by ChangeMoney
         }
     }
-    crate::world::session::send_teleport_unit(
+    crate::world::session::send_teleport_unit_ending_trade(
+        server,
         player,
         SCTeleportUnitPacket {
             reason: crate::systems::skills::packets_special::TELEPORT_REASON_MOVE_TO_LOCATION,

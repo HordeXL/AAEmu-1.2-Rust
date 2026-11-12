@@ -475,8 +475,17 @@ pub fn world_spawn_position_string(p: &crate::data::world_templates::WorldSpawnP
 
 /// `target.DisabledSetPosition = true; target.SendPacket(new SCTeleportUnitPacket(reason, 0, x,
 /// y, z, z2))`.
-pub fn teleport_player(target: &PlayerRef, reason: u8, x: f32, y: f32, z: f32, z2: f32) {
-    crate::world::session::send_teleport_unit(
+pub fn teleport_player(
+    server: &GameServer,
+    target: &PlayerRef,
+    reason: u8,
+    x: f32,
+    y: f32,
+    z: f32,
+    z2: f32,
+) {
+    crate::world::session::send_teleport_unit_ending_trade(
+        server,
         target,
         crate::systems::skills::packets_special::SCTeleportUnitPacket {
             reason,
@@ -869,6 +878,8 @@ pub struct JsonSpawnEntry {
     pub position: Option<JsonPosition>,
     pub scale: f32,
     pub func_group_id: u32,
+    /// `FamilyId` (level-design logic family; doodad rows only).
+    pub family_id: u32,
 }
 
 fn json_position_of(v: &serde_json::Value) -> Result<JsonPosition, String> {
@@ -933,7 +944,10 @@ pub fn parse_spawn_entries(
             entry.scale = j::f32_or(o, "Scale", 0.0)?;
         }
         match kind {
-            SpawnFileKind::Doodad => entry.func_group_id = j::u32_or(o, "FuncGroupId", 0)?,
+            SpawnFileKind::Doodad => {
+                entry.func_group_id = j::u32_or(o, "FuncGroupId", 0)?;
+                entry.family_id = j::u32_or(o, "FamilyId", 0)?;
+            }
             SpawnFileKind::Npc => entry.follow_path = opt_str("FollowPath")?,
             SpawnFileKind::Slave => {}
         }
@@ -972,6 +986,7 @@ impl JsonSpawnEntry {
                 m.push(("Position", pos));
                 m.push(("Scale", JValue::Single(self.scale)));
                 m.push(("FuncGroupId", JValue::from(self.func_group_id)));
+                m.push(("FamilyId", JValue::from(self.family_id)));
             }
             SpawnFileKind::Npc => {
                 m.push(("Title", JValue::opt_str(self.title.clone())));
@@ -997,6 +1012,7 @@ impl JsonSpawnEntry {
                 position: self.position,
                 scale: self.scale,
                 func_group_id: self.func_group_id,
+                family_id: self.family_id,
             }
             .to_jvalue(),
             SpawnFileKind::Npc => JsonNpcSpawns {
@@ -1136,6 +1152,32 @@ pub fn add_runtime_npc_spawner(
     )))
 }
 
+/// Spawns the object returned by [`add_runtime_npc_spawner`]. Only the generated-template
+/// copy (an NPC without an authored spawner) spawns itself; when the NPC has authored
+/// spawners the returned object is a template-less command copy and the manager's clone
+/// spawns on the active-region tick. Calling `SpawnAll` on the copy only logs a misleading
+/// "template is null" error.
+pub fn spawn_runtime_npc_spawner(
+    server: &GameServer,
+    spawner: &Arc<crate::systems::npcs::npc::spawner::NpcSpawner>,
+) {
+    if spawner.template().is_some() {
+        spawner.spawn_all(server, false);
+    }
+}
+
+/// [`NpcSpawner::update`] for the object returned by [`add_runtime_npc_spawner`]: a
+/// template-less command copy must not log the misleading "template is null" warning either;
+/// the manager clone (`/npc spawn`) already holds the template.
+pub fn update_runtime_npc_spawner(
+    server: &GameServer,
+    spawner: &Arc<crate::systems::npcs::npc::spawner::NpcSpawner>,
+) {
+    if spawner.template().is_some() {
+        spawner.update(server);
+    }
+}
+
 /// The spawner of a doodad (`doodad.Spawner`).
 pub fn doodad_spawner_of(server: &GameServer, obj_id: u32) -> Option<Arc<DoodadSpawner>> {
     server.systems.npcs.spawns.doodad_spawner_of(obj_id)
@@ -1163,6 +1205,7 @@ pub fn new_doodad_spawner(
             scale: 1.0,
             count: 1,
             related_ids: None,
+            family_id: 0,
             respawn_doodad_template_id: 0,
         },
         Some(world_id),
